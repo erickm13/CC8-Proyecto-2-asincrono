@@ -1,0 +1,56 @@
+  ---
+  Resumen fácil de explicar (para el catedrático)
+
+  El problema en una frase: tenemos imágenes de 50 GB+ que no caben ni en la red ni en
+  el navegador, así que hay que mandar solo lo que el usuario está viendo y solo el
+  detalle que necesita en ese momento.
+
+  La analogía: piensa en cómo carga una foto en internet con mala señal: primero se ve
+  borrosa y completa, y poco a poco se va aclarando. Nuestro sistema hace eso, pero
+  además:
+  1. Solo aclara la parte de la imagen que estás mirando (no toda).
+  2. Si te alejas, borra el detalle fino que ya no necesitas (libera memoria del
+  navegador).
+  3. Si te acercas, pide más detalle solo de esa zona.
+
+  Eso es literal lo que pide el enunciado: "transferencia y eliminación de información
+  para aumentar o disminuir la resolución".
+
+  Cómo lo logramos, en 3 piezas (con nombre bonito y su justificación):
+
+  Pieza: 1. Descomposición (wavelet, estilo JPEG2000)
+  Qué hace: Guarda cada imagen partida en "capas": una base borrosa + capas de detalle
+    cada vez más fino, y por regiones.
+  En palabras simples: Como las capas de una cebolla: la de adentro es la versión
+    borrosa, cada capa de afuera añade nitidez.
+  ────────────────────────────────────────
+  Pieza: 2. Orden de envío (curva de Hilbert)
+  Qué hace: Decide en qué orden mandar las regiones para que la imagen se llene de forma
+
+    pareja y las zonas vecinas lleguen juntas.
+  En palabras simples: En vez de llenar la pantalla en zigzag de esquina a esquina, la
+    llena "por cercanía", como coloreando sin saltos.
+  ────────────────────────────────────────
+  Pieza: 3. Control de tráfico (planificador por deadline + utilidad)
+  Qué hace: En cada momento decide qué mandar primero según: ¿lo está viendo ahora?
+    (urgencia) y ¿cuánto mejora la imagen por cada byte? (rendimiento). Ajusta la
+    velocidad a la conexión y a la memoria del cliente.
+  En palabras simples: Como un mesero inteligente: sirve primero lo que el cliente pidió
+
+    y lo que más lo satisface, sin saturar la mesa.
+
+
+  ▎ "El servidor guarda la imagen en capas de detalle por regiones (inspirado en
+  ▎ JPEG2000), las envía en un orden espacial inteligente (curva de Hilbert) y un
+  ▎ planificador decide en tiempo real qué trozo conviene mandar según lo que el usuario
+  ▎ mira y el ancho de banda disponible, transfiriendo y descartando detalle conforme
+  ▎ el usuario acerca o aleja."
+
+  Lo que nos hace distintos del resto: casi todos harán el "zoom por mosaicos" clásico
+  (tiling piramidal). Nosotros refinamos la calidad en el sitio por capas, con un orden
+  de envío propio (Hilbert) y un planificador que optimiza detalle-por-byte — eso es lo
+  que documentamos como protocolo propio y difícilmente se repite.
+
+  ---
+  Sigo con la implementación del empaquetado de bit-planes y el formato en disco. Te
+  aviso cuando tenga la Fase 1 completa y probada de punta a punta.

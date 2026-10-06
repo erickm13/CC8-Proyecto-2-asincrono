@@ -1,0 +1,24 @@
+# Compilados Java
+out/
+*.class
+sources.txt
+
+# Artefactos generados por preprocesamiento / pruebas
+images/*.h2k
+images/*.png
+demo/
+tmp_ingest/
+*.ppm
+
+# Imágenes de ultra alta resolución (datos, no van al repo)
+*.h2k
+*.bmp
+
+# PDF del enunciado (material del curso)
+*.pdf
+
+# Sistema operativo / editores
+.DS_Store
+*.swp
+.idea/
+.vscode/

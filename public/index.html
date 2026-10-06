@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visor RAPID · Servidor Asíncrono CC VIII</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header>
+        <div>
+            <h1>Visor RAPID</h1>
+            <span class="sub">Reliable Adaptive Progressive Image Delivery · CC VIII</span>
+        </div>
+        <div class="controls">
+            <button id="fit">Ajustar</button>
+            <span>Estado: <b id="status">iniciando…</b></span>
+        </div>
+    </header>
+
+    <div id="stats">esperando datos…</div>
+
+    <canvas id="view"></canvas>
+
+    <footer>
+        Rueda del ratón = zoom · Arrastrar = desplazar. La imagen se carga borrosa y
+        se refina progresivamente solo en la zona visible (protocolo propio sobre WebSocket).
+    </footer>
+
+    <script type="module" src="/js/app.js"></script>
+</body>
+</html>

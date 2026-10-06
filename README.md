@@ -85,7 +85,7 @@ Navegador (public/)                         Servidor (Java, src/)
 | Todo servido por el servidor Java (sin recursos externos) | `handler/StaticFileHandler`, librerías propias |
 | Carga progresiva/selectiva (transferir y eliminar info) | `image/` (capas) + `protocol/Scheduler` + LRU/`FORGET` |
 | No saturar el navegador | caché LRU + flow control (`rwnd`) |
-| Imágenes de 24–93 GB | `image/PngStreamReader` (ingesta por streaming) |
+| Imágenes de 24–93 GB | `image/PngStreamReader` (ingesta por streaming) + overview (`GET /api/overview`) para la vista alejada |
 
 ## Pruebas incluidas
 

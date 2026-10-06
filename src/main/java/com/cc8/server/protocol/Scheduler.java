@@ -42,6 +42,9 @@ public final class Scheduler implements SegmentSource {
     /** Margen de tiles alrededor del viewport que se precargan (prefetch). */
     private static final int PREFETCH_MARGIN = 1;
 
+    /** Tope de tiles a enumerar por viewport (la vista alejada usa el overview). */
+    private static final int MAX_VIEWPORT_TILES = 256;
+
     private record Cand(int tile, int comp, H2kFormat.PacketIndex p, int layer,
                         int deadline, double utility, long hilbert) {
     }
@@ -85,6 +88,18 @@ public final class Scheduler implements SegmentSource {
         int tyMinP = clamp(tyMin - PREFETCH_MARGIN, 0, h.tilesY() - 1);
         int txMaxP = clamp(txMax + PREFETCH_MARGIN, 0, h.tilesX() - 1);
         int tyMaxP = clamp(tyMax + PREFETCH_MARGIN, 0, h.tilesY() - 1);
+
+        // Proteccion: si el rango es enorme (vista muy alejada en una imagen
+        // gigante), limitar la enumeracion a una ventana centrada; la vista
+        // alejada se cubre con el overview, no pidiendo decenas de miles de tiles.
+        if ((long) (txMaxP - txMinP + 1) * (tyMaxP - tyMinP + 1) > MAX_VIEWPORT_TILES) {
+            int cx = (txMin + txMax) / 2, cy = (tyMin + tyMax) / 2;
+            int side = (int) Math.sqrt(MAX_VIEWPORT_TILES) / 2;
+            txMinP = clamp(cx - side, 0, h.tilesX() - 1);
+            txMaxP = clamp(cx + side, 0, h.tilesX() - 1);
+            tyMinP = clamp(cy - side, 0, h.tilesY() - 1);
+            tyMaxP = clamp(cy + side, 0, h.tilesY() - 1);
+        }
 
         List<Cand> cands = new ArrayList<>();
         for (int ty = tyMinP; ty <= tyMaxP; ty++) {

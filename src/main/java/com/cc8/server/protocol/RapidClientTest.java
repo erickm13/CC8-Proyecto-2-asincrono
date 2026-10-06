@@ -52,7 +52,7 @@ public final class RapidClientTest {
         System.out.printf("Manifiesto: %dx%d comps=%d tile=%d levels=%d%n",
                 width, height, components, tileSize, levels);
         H2kFormat.Header hdr = new H2kFormat.Header(1, 0, components, 8, tileSize,
-                levels, precinct, width, height, tilesX, tilesY, 0);
+                levels, precinct, width, height, tilesX, tilesY, 0, 0, 0, 0, 0);
 
         // 2) Ensamblador de paquetes.
         Map<Integer, Map<Integer, Map<Long, Acc>>> store = new HashMap<>();

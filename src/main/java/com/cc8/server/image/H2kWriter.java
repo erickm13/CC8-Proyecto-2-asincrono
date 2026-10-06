@@ -1,7 +1,9 @@
 package com.cc8.server.image;
 
+import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.FilterOutputStream;
 import java.io.IOException;
@@ -69,6 +71,13 @@ public final class H2kWriter {
         // Una franja de tileSize filas a ancho completo (unico buffer grande).
         byte[] strip = new byte[width * tileSize * components];
 
+        // Overview (thumbnail): el bloque LL (s0 x s0) de cada tile. Resolucion
+        // = imagen / 2^levels. Se arma en memoria y se guarda como PNG al final.
+        int s0 = tileSize >> levels;
+        int ovW = tilesX * s0;
+        int ovH = tilesY * s0;
+        byte[] overview = new byte[ovW * ovH * components];
+
         try (Counting counting = new Counting(
                 new BufferedOutputStream(Files.newOutputStream(outputPath), 1 << 20));
              DataOutputStream out = new DataOutputStream(counting)) {
@@ -93,6 +102,7 @@ public final class H2kWriter {
                         int[] coeff = extractFromStrip(strip, width, components,
                                 x0, validW, validH, c);
                         HaarWavelet.forward2D(coeff, tileSize, levels);
+                        extractOverview(coeff, overview, ovW, components, s0, tx, ty, c);
                         compIndices.add(encodeComponent(coeff, out, counting));
                     }
 
@@ -108,11 +118,54 @@ public final class H2kWriter {
                 out.writeLong(tileIdxOffset[t]);
                 out.writeInt(tileIdxLen[t]);
             }
+
+            // Overview al final del archivo, como PNG.
+            long ovOffset = counting.count;
+            byte[] png = encodeOverviewPng(overview, ovW, ovH, components);
+            out.write(png);
             out.flush();
-            patchTileDirOffset(outputPath, dirOffset);
+
+            patchHeader(outputPath, dirOffset, ovOffset, png.length, ovW, ovH);
         } finally {
             src.close();
         }
+    }
+
+    /** Copia el bloque LL (s0 x s0) del tile transformado al buffer de overview. */
+    private void extractOverview(int[] coeff, byte[] overview, int ovW, int components,
+                                 int s0, int tx, int ty, int comp) {
+        for (int ly = 0; ly < s0; ly++) {
+            int orow = (ty * s0 + ly) * ovW;
+            for (int lx = 0; lx < s0; lx++) {
+                int v = coeff[ly * tileSize + lx] + H2kFormat.LEVEL_SHIFT;
+                v = v < 0 ? 0 : (v > 255 ? 255 : v);
+                overview[(orow + tx * s0 + lx) * components + comp] = (byte) v;
+            }
+        }
+    }
+
+    private static byte[] encodeOverviewPng(byte[] overview, int ovW, int ovH,
+                                            int components) throws IOException {
+        BufferedImage img = new BufferedImage(ovW, ovH, components == 1
+                ? BufferedImage.TYPE_BYTE_GRAY : BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < ovH; y++) {
+            for (int x = 0; x < ovW; x++) {
+                int base = (y * ovW + x) * components;
+                int rgb;
+                if (components == 1) {
+                    int v = overview[base] & 0xFF;
+                    rgb = (v << 16) | (v << 8) | v;
+                } else {
+                    rgb = ((overview[base] & 0xFF) << 16)
+                            | ((overview[base + 1] & 0xFF) << 8)
+                            | (overview[base + 2] & 0xFF);
+                }
+                img.setRGB(x, y, rgb);
+            }
+        }
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ImageIO.write(img, "png", bos);
+        return bos.toByteArray();
     }
 
     // ---- Codificacion de un componente de un tile ------------------------
@@ -204,10 +257,16 @@ public final class H2kWriter {
         }
     }
 
-    private void patchTileDirOffset(Path path, long dirOffset) throws IOException {
+    private void patchHeader(Path path, long dirOffset, long ovOffset, int ovLen,
+                             int ovW, int ovH) throws IOException {
         try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw")) {
             raf.seek(H2kFormat.TILEDIR_OFFSET_FIELD);
             raf.writeLong(dirOffset);
+            raf.seek(H2kFormat.OVERVIEW_OFFSET_FIELD);
+            raf.writeLong(ovOffset);
+            raf.writeInt(ovLen);       // 52
+            raf.writeInt(ovW);         // 56
+            raf.writeInt(ovH);         // 60
         }
     }
 

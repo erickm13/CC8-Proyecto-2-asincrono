@@ -13,6 +13,8 @@ const statsEl = document.getElementById('stats');
 let header = null;
 let ws = null;
 let receiver = null;
+let overviewBitmap = null;       // thumbnail de toda la imagen (capa base)
+const REQUEST_TILES_CAP = 120;   // no pedir tiles si la vista abarca más que esto
 
 // Caché de paquetes: tile -> [comp] -> Map(pkey -> precinct)
 const tiles = new Map();
@@ -38,6 +40,14 @@ async function main() {
     header = await (await fetch('/api/manifest')).json();
     resizeCanvas();
     fitView();
+
+    // Cargar el overview (thumbnail) para mostrar la imagen completa al instante.
+    if (header.hasOverview) {
+        try {
+            const blob = await (await fetch('/api/overview')).blob();
+            overviewBitmap = await createImageBitmap(blob);
+        } catch (e) { /* sin overview: se verá solo lo que llegue por tiles */ }
+    }
 
     ws = new WebSocket(`ws://${location.host}/stream`);
     ws.binaryType = 'arraybuffer';
@@ -196,6 +206,16 @@ function frame() {
 function draw() {
     ctx.fillStyle = '#0b0e1a';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Capa base: el overview estirado sobre toda la imagen (aparece al instante).
+    if (overviewBitmap) {
+        const dx = (0 - view.offsetX) * view.scale;
+        const dy = (0 - view.offsetY) * view.scale;
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(overviewBitmap, dx, dy, header.width * view.scale, header.height * view.scale);
+    }
+
+    // Encima, los tiles ya recibidos (nítidos) donde los haya.
     ctx.imageSmoothingEnabled = false;
     for (const { canvas: c, x0, y0, vw, vh } of tileCanvas.values()) {
         const dx = (x0 - view.offsetX) * view.scale;
@@ -226,6 +246,13 @@ function sendViewport() {
     const vy = Math.max(0, Math.floor(view.offsetY));
     const vw = Math.min(header.width - vx, Math.ceil(canvas.width / view.scale));
     const vh = Math.min(header.height - vy, Math.ceil(canvas.height / view.scale));
+    // Si la vista abarca demasiados tiles (muy alejado), basta el overview: no
+    // pedimos tiles para no enumerar/transferir decenas de miles.
+    const ts = header.tileSize;
+    const ntx = Math.floor((vx + vw - 1) / ts) - Math.floor(vx / ts) + 1;
+    const nty = Math.floor((vy + vh - 1) / ts) - Math.floor(vy / ts) + 1;
+    if (ntx * nty > REQUEST_TILES_CAP) return;
+
     // Nivel de resolución necesario según el zoom (no pedir detalle innecesario).
     const maxLevel = clamp(Math.round(header.levels + Math.log2(view.scale)) + 1, 0, header.levels);
     ws.send(encodeViewport(vx, vy, Math.max(1, vw), Math.max(1, vh), maxLevel));

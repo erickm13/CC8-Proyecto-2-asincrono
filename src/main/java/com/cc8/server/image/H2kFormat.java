@@ -22,7 +22,12 @@ public final class H2kFormat {
     public static final byte[] MAGIC = {'H', '2', 'K', '1'};
     public static final int VERSION = 1;
     public static final int HEADER_SIZE = 64;
-    public static final int TILEDIR_OFFSET_FIELD = 36; // posicion del long en el header
+    public static final int TILEDIR_OFFSET_FIELD = 36; // long: offset al directorio de tiles
+    // Vista general (overview / thumbnail) en el espacio reservado del header:
+    public static final int OVERVIEW_OFFSET_FIELD = 44; // long: offset al PNG de overview
+    public static final int OVERVIEW_LEN_FIELD = 52;    // int: longitud del PNG
+    public static final int OVERVIEW_W_FIELD = 56;      // int: ancho del overview
+    public static final int OVERVIEW_H_FIELD = 60;      // int: alto del overview
 
     // Parametros por defecto del preprocesamiento.
     public static final int DEFAULT_TILE = 512;
@@ -37,7 +42,14 @@ public final class H2kFormat {
     public record Header(int version, int colorTransform, int components,
                          int bitDepth, int tileSize, int levels, int precinct,
                          int width, int height, int tilesX, int tilesY,
-                         long tileDirOffset) {
+                         long tileDirOffset,
+                         long overviewOffset, int overviewLen,
+                         int overviewW, int overviewH) {
+
+        /** Factor de escala del overview respecto a la imagen (= 2^levels). */
+        public int overviewScale() {
+            return tileSize / (tileSize >> levels);
+        }
     }
 
     /** Indice de un precinct: metadatos + ubicacion de cada capa (plano). */

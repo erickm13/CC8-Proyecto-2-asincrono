@@ -46,9 +46,14 @@ public final class H2kReader implements Closeable {
         int tilesX = getInt(head, 28);
         int tilesY = getInt(head, 32);
         long tileDirOffset = getLong(head, 36);
+        long overviewOffset = getLong(head, 44);
+        int overviewLen = getInt(head, 52);
+        int overviewW = getInt(head, 56);
+        int overviewH = getInt(head, 60);
         this.header = new H2kFormat.Header(head[4] & 0xFF, head[5] & 0xFF, components,
                 bitDepth, tileSize, levels, precinct, width, height,
-                tilesX, tilesY, tileDirOffset);
+                tilesX, tilesY, tileDirOffset,
+                overviewOffset, overviewLen, overviewW, overviewH);
 
         int numTiles = tilesX * tilesY;
         this.tileIdxOffset = new long[numTiles];
@@ -62,6 +67,14 @@ public final class H2kReader implements Closeable {
 
     public H2kFormat.Header header() {
         return header;
+    }
+
+    /** PNG del overview (thumbnail), o null si el archivo no lo incluye. */
+    public byte[] overviewPng() throws IOException {
+        if (header.overviewLen() <= 0) {
+            return null;
+        }
+        return readAt(header.overviewOffset(), header.overviewLen());
     }
 
     public int numTiles() {

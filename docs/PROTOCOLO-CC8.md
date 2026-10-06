@@ -156,6 +156,17 @@ El **directorio de tiles** lista, por cada tile, `(offset, longitud)` de su bloq
 50 GB+ (el índice completo nunca se carga de una vez). El servicio usa lectura
 posicional (`FileChannel.read(buf, pos)` / `mmap` por región).
 
+### 3.3 Vista general (overview / thumbnail)
+
+El preprocesador también genera un **overview**: el bloque LL (la sub-banda más
+gruesa, `s0×s0`) de cada tile, ensamblado en una miniatura de toda la imagen a
+resolución `1/2^levels` (p.ej. 1/32). Se guarda como PNG al final del `.h2k` (campos
+`overviewOffset/Len/W/H` en el header) y se sirve por **HTTP `GET /api/overview`** en
+una sola petición. El cliente lo pinta como capa base **al instante** cuando la vista
+está alejada, y solo solicita tiles por WebSocket cuando el usuario se acerca lo
+suficiente. Así, explorar una imagen de 93 GB nunca enumera sus decenas de miles de
+tiles: la vista alejada usa el overview; la cercana, unos pocos tiles.
+
 ---
 
 ## 4. Transporte RAPID: modelo general

@@ -45,6 +45,13 @@ public final class Main {
             router.get("/api/manifest", req -> HttpResponse.ok()
                     .body(manifestJson(h, imagePath).getBytes(java.nio.charset.StandardCharsets.UTF_8),
                             "application/json; charset=utf-8"));
+            router.get("/api/overview", req -> {
+                byte[] png = reader.overviewPng();
+                if (png == null) {
+                    return HttpResponse.notFound();
+                }
+                return HttpResponse.ok().body(png, "image/png");
+            });
             server.upgrade(new WebSocketEndpoint("/stream", new ImageProtocolHandler(reader)));
             System.out.printf("Imagen cargada: %s  (%dx%d, %d componentes, %d niveles)%n",
                     imagePath, h.width(), h.height(), h.components(), h.levels());
@@ -69,7 +76,11 @@ public final class Main {
                 + "\"levels\":" + h.levels() + ","
                 + "\"precinct\":" + h.precinct() + ","
                 + "\"tilesX\":" + h.tilesX() + ","
-                + "\"tilesY\":" + h.tilesY()
+                + "\"tilesY\":" + h.tilesY() + ","
+                + "\"overviewW\":" + h.overviewW() + ","
+                + "\"overviewH\":" + h.overviewH() + ","
+                + "\"overviewScale\":" + h.overviewScale() + ","
+                + "\"hasOverview\":" + (h.overviewLen() > 0)
                 + "}";
     }
 }

@@ -51,6 +51,14 @@ public final class PngIngestTest {
                 }
                 System.out.printf("OK  reconstruccion sin perdida (%dx%d)%n",
                         img.getWidth(), img.getHeight());
+
+                byte[] ov = reader.overviewPng();
+                if (ov == null || reader.header().overviewW() <= 0) {
+                    System.out.println("FALLO: overview ausente");
+                    System.exit(1);
+                }
+                System.out.printf("OK  overview presente (%dx%d, %d bytes)%n",
+                        reader.header().overviewW(), reader.header().overviewH(), ov.length);
             }
             System.out.println("PngIngestTest paso.");
         } finally {

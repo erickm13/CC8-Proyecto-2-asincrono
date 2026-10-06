@@ -97,6 +97,7 @@ Navegador (public/)                         Servidor (Java, src/)
 | `HilbertSelfTest` | curva de Hilbert (biyección + localidad) |
 | `WebSocketSelfTest` | handshake (ejemplo RFC 6455) + frames |
 | `TransportSelfTest` | entrega 100% bajo pérdida 10–30% (SACK, congestión) |
+| `FlowControlTest` | el emisor nunca excede `rwnd` (control de flujo) |
 | `IntegrationSelfTest` | scheduler→transporte→reconstrucción sin pérdida |
 | `SchedulerOrderTest` | orden del scheduler: resolución + capa + utilidad/byte (rate-distortion) |
 | `SchedulerForgetTest` | ciclo LRU olvido→reenvío |

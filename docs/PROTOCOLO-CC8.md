@@ -328,10 +328,21 @@ Valores iniciales: `cwnd = 1`, `ssthresh = 64` segmentos.
 
 ### 6.5 Control de flujo (flow control)
 
-El cliente calcula `rwnd` a partir de su **presupuesto de memoria/caché** (cuántos
-paquetes puede almacenar sin degradarse) y lo anuncia en cada ACK y en mensajes
-`WIN`. El servidor jamás pone en vuelo más de `rwnd` segmentos → **protege al
-navegador** de saturación (requisito explícito).
+El cliente **calcula `rwnd` dinámicamente** según su propio estado y lo anuncia en
+cada ACK. El servidor jamás pone en vuelo más de `rwnd` segmentos
+(`ventana = mín(cwnd, rwnd)`) → **protege al navegador** de saturación:
+
+```
+ headroom  = (MAX_TILES − tiles_en_cache) / MAX_TILES      (0..1)
+ backlog   = min(decodificaciones_pendientes / 64, 1)       (0..1)
+ rwnd      = MIN_RWND + headroom·(1 − backlog)·(MAX_RWND − MIN_RWND)
+            (acotado a [MIN_RWND, MAX_RWND] = [8, 256] segmentos)
+```
+
+Cuando la caché está casi llena o hay mucho backlog de decodificación, `rwnd` se
+encoge y el servidor reduce el ritmo; al desalojar (LRU) o vaciar el backlog, `rwnd`
+sube y el flujo se recupera. Es un lazo de realimentación cerrado cliente↔servidor.
+(Verificado: con `rwnd = 4` el emisor nunca supera 4 segmentos en vuelo.)
 
 ---
 

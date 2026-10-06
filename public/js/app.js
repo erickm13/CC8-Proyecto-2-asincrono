@@ -22,12 +22,17 @@ const dirty = new Set();
 
 // Vista (coordenadas de imagen): screenX = (imgX - offsetX) * scale
 const view = { scale: 1, offsetX: 0, offsetY: 0 };
-let stats = { packets: 0, bytes: 0, evicted: 0 };
+let stats = { packets: 0, bytes: 0, evicted: 0, rwnd: 0 };
 
 // Desalojo LRU: no guardar más de MAX_TILES tiles en caché del navegador.
 const MAX_TILES = 160;
 const lastUsed = new Map();   // tile -> reloj lógico de último uso
 let clock = 0;
+
+// Control de flujo dinámico: rwnd (en segmentos) según el estado del cliente.
+const MIN_RWND = 8;
+const MAX_RWND = 256;
+let pendingDecodes = 0;       // paquetes esperando inflado/decodificación
 
 async function main() {
     header = await (await fetch('/api/manifest')).json();
@@ -36,7 +41,7 @@ async function main() {
 
     ws = new WebSocket(`ws://${location.host}/stream`);
     ws.binaryType = 'arraybuffer';
-    receiver = new Receiver(buf => ws.send(buf), onPacket, 100000);
+    receiver = new Receiver(buf => ws.send(buf), onPacket, MAX_RWND);
 
     ws.onopen = () => { setStatus('conectado', true); sendViewport(); };
     ws.onclose = () => setStatus('desconectado', false);
@@ -72,12 +77,32 @@ async function onPacket(payload) {
     stats.packets++;
     stats.bytes += pk.data.length;
     lastUsed.set(pk.tile, ++clock);
-    const inflated = await inflateRaw(pk.data);   // DEFLATE nativo del navegador
-    pr.layers[pk.layer] = inflated;
-    let r = 0;
-    while (r < pr.numPlanes && pr.layers[r]) r++;
-    pr.received = r;
-    dirty.add(pk.tile);
+    pendingDecodes++;
+    try {
+        const inflated = await inflateRaw(pk.data);   // DEFLATE nativo del navegador
+        pr.layers[pk.layer] = inflated;
+        let r = 0;
+        while (r < pr.numPlanes && pr.layers[r]) r++;
+        pr.received = r;
+        dirty.add(pk.tile);
+    } finally {
+        pendingDecodes--;
+    }
+}
+
+/**
+ * Ajusta rwnd (flow control) al estado del cliente: la ventana se encoge si la
+ * caché está casi llena o si hay mucho backlog de decodificación, de modo que el
+ * servidor reduce el ritmo y no satura el navegador; se recupera al liberarse.
+ */
+function updateRwnd() {
+    if (!receiver) return;
+    const cacheHeadroom = clamp((MAX_TILES - tiles.size) / MAX_TILES, 0, 1);
+    const backlogPenalty = clamp(pendingDecodes / 64, 0, 1);
+    const factor = cacheHeadroom * (1 - backlogPenalty);
+    const rwnd = Math.round(MIN_RWND + factor * (MAX_RWND - MIN_RWND));
+    receiver.rwnd = Math.max(MIN_RWND, rwnd);
+    stats.rwnd = receiver.rwnd;
 }
 
 // ---- Desalojo LRU (libera memoria y avisa al servidor con FORGET) ----------
@@ -164,6 +189,7 @@ function frame() {
     }
     draw();
     evict();
+    updateRwnd();
     requestAnimationFrame(frame);
 }
 
@@ -245,7 +271,7 @@ function updateStats() {
         `paquetes: ${stats.packets} · datos: ${(stats.bytes / 1024).toFixed(1)} KB · ` +
         `entregados: ${receiver.delivered} · fuera de orden: ${receiver.ooo.size} · ` +
         `caché: ${tiles.size}/${MAX_TILES} tiles · desalojados: ${stats.evicted} · ` +
-        `zoom: ${view.scale.toFixed(2)}×`;
+        `rwnd: ${stats.rwnd} · zoom: ${view.scale.toFixed(2)}×`;
 }
 
 function setStatus(text, ok) {

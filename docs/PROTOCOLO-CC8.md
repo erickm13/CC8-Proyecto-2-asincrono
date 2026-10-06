@@ -335,27 +335,37 @@ navegador** de saturación (requisito explícito).
 
 ---
 
-## 7. ¿Qué enviar? Scheduler (Hilbert + deadline/utilidad)
+## 7. ¿Qué enviar? Scheduler (deadline + rate-distortion + Hilbert)
 
 El control de congestión decide **cuántos** segmentos enviar; el **scheduler** decide
-**cuáles** y en **qué orden**, actuando como fuente del emisor:
+**cuáles** y en **qué orden**, actuando como fuente del emisor. De `VIEWPORT
+(x,y,w,h,zoom)` se derivan los paquetes candidatos (tiles visibles + un anillo de
+prefetch, niveles hasta el zoom pedido, precincts, capas pendientes aún no enviadas)
+y se **ordenan** por una clave de 5 criterios (de más a menos prioritario):
 
-1. **Selección por viewport:** de `VIEWPORT (x,y,w,h,zoom)` se derivan los paquetes
-   candidatos: tiles visibles, niveles de resolución hasta el zoom pedido, precincts
-   dentro de la zona, capas pendientes.
-2. **Orden de progresión Hilbert:** los precincts se ordenan según una **curva de
-   Hilbert** (Hilbert, 1891). Preserva localidad 2D: la imagen se llena de forma
-   espacialmente homogénea y las regiones vecinas llegan juntas. Es nuestra
-   alternativa propia a los órdenes de progresión LRCP/RPCL de JPEG2000.
-3. **Utilidad y deadline (rate-distortion):**
-   ```
-   prioridad(paquete) = utilidad / bytes ,   con deadline según visibilidad
-   utilidad ≈ energía/reducción de distorsión del plano de bits
-   deadline: visible ahora = urgente ; prefetch de alrededores = flojo
-   ```
-   Se envían primero los paquetes que **más mejoran la imagen por byte** dentro de lo
-   visible; al cambiar el viewport, los paquetes obsoletos se **cancelan/despriorizan**
-   al instante (posible gracias a la numeración por segmento independiente).
+| # | Criterio | Efecto |
+|---|----------|--------|
+| 1 | **deadline** (0 visible / 1 prefetch) | lo que se ve ahora va antes que la precarga de alrededores |
+| 2 | **resolución** (nivel ascendente) | la imagen aparece completa y borrosa y se va afinando |
+| 3 | **capa de calidad** (plano MSB→LSB) | progresión por calidad; garantiza planos **contiguos** por precinct (requisito del decodificador) |
+| 4 | **utilidad/byte** (descendente) | **rate-distortion**: entre precincts del mismo plano, primero el que más detalle aporta por byte |
+| 5 | **Hilbert** (tile, precinct) | desempate espacial: cobertura homogénea, regiones vecinas juntas (Hilbert, 1891) |
+
+**Utilidad/byte (criterio 4).** Para el plano de bits `p` de un precinct con `N`
+coeficientes y `B` bytes comprimidos:
+```
+utilidad(paquete) = N · 2^(2p) / B
+```
+El factor `2^(2p)` aproxima la reducción de **error cuadrático** al añadir ese plano
+(cada coeficiente reduce su incertidumbre a la mitad por plano); dividir entre `B`
+da la ganancia **por byte transmitido** (principio rate-distortion, análogo al PCRD
+de JPEG2000). Así, dentro de cada plano, los precincts más informativos (bordes,
+texto) se envían antes que las zonas planas.
+
+Al cambiar el viewport, la cola se **reconstruye** al instante para la nueva zona
+(los paquetes ya enviados se excluyen); los que dejan de ser visibles simplemente no
+se re-encolan. La numeración por segmento independiente permite esta repriorización
+sin bloqueos.
 
 ---
 

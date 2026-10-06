@@ -6,6 +6,7 @@ import com.cc8.server.image.H2kReader;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -38,7 +39,11 @@ public final class Scheduler implements SegmentSource {
     private List<Cand> queue = new ArrayList<>();
     private int cursor = 0;
 
-    private record Cand(int tile, int comp, H2kFormat.PacketIndex p, int layer, long key) {
+    /** Margen de tiles alrededor del viewport que se precargan (prefetch). */
+    private static final int PREFETCH_MARGIN = 1;
+
+    private record Cand(int tile, int comp, H2kFormat.PacketIndex p, int layer,
+                        int deadline, double utility, long hilbert) {
     }
 
     public Scheduler(H2kReader reader) {
@@ -49,9 +54,23 @@ public final class Scheduler implements SegmentSource {
     }
 
     /**
-     * Fija la zona visible (en coordenadas de la imagen completa), el maximo
-     * nivel de resolucion y el maximo de capas de calidad a entregar, y
-     * reconstruye la cola de prioridad con lo que aun falta.
+     * Fija la zona visible (coordenadas de la imagen completa), el maximo nivel
+     * de resolucion y el maximo de capas, y reconstruye la cola de prioridad
+     * con lo que aun falta. Orden de prioridad (de mas a menos urgente):
+     * <ol>
+     *   <li><b>deadline</b>: 0 = tile visible ahora; 1 = anillo de prefetch.</li>
+     *   <li><b>resolucion</b>: nivel ascendente (grueso -> fino), para que la
+     *       imagen aparezca completa y borrosa y se vaya afinando.</li>
+     *   <li><b>capa de calidad</b>: plano de bits ascendente (MSB -> LSB) dentro
+     *       del nivel. Garantiza que cada precinct reciba sus planos en orden
+     *       contiguo (requisito del decodificador) y da una progresion por
+     *       calidad (estilo JPEG2000).</li>
+     *   <li><b>utilidad/byte</b> descendente ENTRE precincts del mismo plano:
+     *       reduccion de distorsion por byte (rate-distortion). Para el plano p
+     *       de un precinct con N coeficientes y B bytes: utilidad = N · 2^(2p)/B.
+     *       Prioriza los precincts mas "informativos" (mas detalle por byte).</li>
+     *   <li><b>Hilbert</b> (tile y precinct) como desempate espacial.</li>
+     * </ol>
      */
     public synchronized void setViewport(int x, int y, int w, int h0,
                                          int maxLevel, int maxLayers) {
@@ -61,9 +80,17 @@ public final class Scheduler implements SegmentSource {
         int txMax = clamp((x + w - 1) / ts, 0, h.tilesX() - 1);
         int tyMax = clamp((y + h0 - 1) / ts, 0, h.tilesY() - 1);
 
+        // Rango ampliado con el margen de prefetch.
+        int txMinP = clamp(txMin - PREFETCH_MARGIN, 0, h.tilesX() - 1);
+        int tyMinP = clamp(tyMin - PREFETCH_MARGIN, 0, h.tilesY() - 1);
+        int txMaxP = clamp(txMax + PREFETCH_MARGIN, 0, h.tilesX() - 1);
+        int tyMaxP = clamp(tyMax + PREFETCH_MARGIN, 0, h.tilesY() - 1);
+
         List<Cand> cands = new ArrayList<>();
-        for (int ty = tyMin; ty <= tyMax; ty++) {
-            for (int tx = txMin; tx <= txMax; tx++) {
+        for (int ty = tyMinP; ty <= tyMaxP; ty++) {
+            for (int tx = txMinP; tx <= txMaxP; tx++) {
+                boolean visible = tx >= txMin && tx <= txMax && ty >= tyMin && ty <= tyMax;
+                int deadline = visible ? 0 : 1;
                 int tile = ty * h.tilesX() + tx;
                 long tileH = HilbertCurve.xy2d(hilbertTileN, tx, ty);
                 H2kFormat.TileIndex idx = tileIndex(tile);
@@ -76,21 +103,40 @@ public final class Scheduler implements SegmentSource {
                         long precH = HilbertCurve.xy2d(hilbertPrecN,
                                 Math.min(p.px(), hilbertPrecN - 1),
                                 Math.min(p.py(), hilbertPrecN - 1));
+                        long hilbert = (tileH << 20) | (precH & 0xFFFFF);
                         for (int layer = 0; layer < layers; layer++) {
                             long id = packetId(tile, comp, p.level(), p.py(), p.px(), layer);
                             if (sent.contains(id)) {
                                 continue;
                             }
-                            long key = priorityKey(p.level(), layer, tileH, precH);
-                            cands.add(new Cand(tile, comp, p, layer, key));
+                            double utility = utilityPerByte(p, layer);
+                            cands.add(new Cand(tile, comp, p, layer, deadline, utility, hilbert));
                         }
                     }
                 }
             }
         }
-        cands.sort((a, b) -> Long.compareUnsigned(a.key, b.key));
+        cands.sort(Comparator
+                .comparingInt(Cand::deadline)                    // 1) visible antes que prefetch
+                .thenComparingInt(c -> c.p().level())            // 2) resolucion: grueso -> fino
+                .thenComparingInt(Cand::layer)                   // 3) calidad: plano MSB -> LSB (contiguo)
+                .thenComparing(Comparator.comparingDouble(Cand::utility).reversed()) // 4) utilidad/byte entre precincts
+                .thenComparingLong(Cand::hilbert));              // 5) localidad espacial
         this.queue = cands;
         this.cursor = 0;
+    }
+
+    /**
+     * Utilidad por byte (rate-distortion) del paquete de la capa {@code layer}.
+     * La capa L corresponde al plano de bits p = numPlanes-1-L; anadir ese plano
+     * reduce el error cuadratico de cada coeficiente en una cantidad proporcional
+     * a 2^(2p). Dividido entre los bytes comprimidos da la ganancia por byte.
+     */
+    private static double utilityPerByte(H2kFormat.PacketIndex p, int layer) {
+        int plane = p.numPlanes() - 1 - layer;
+        double gain = (double) p.numCoeffs() * Math.scalb(1.0, 2 * plane); // N · 2^(2p)
+        int bytes = Math.max(1, p.layerLen()[layer]);
+        return gain / bytes;
     }
 
     /**
@@ -132,14 +178,6 @@ public final class Scheduler implements SegmentSource {
                 throw new UncheckedIOException(e);
             }
         });
-    }
-
-    // Prioridad: nivel (6b) | capa (8b) | Hilbert tile (30b) | Hilbert precinct (20b)
-    private static long priorityKey(int level, int layer, long tileH, long precH) {
-        return ((long) (level & 0x3F) << 58)
-                | ((long) (layer & 0xFF) << 50)
-                | ((tileH & 0x3FFFFFFF) << 20)
-                | (precH & 0xFFFFF);
     }
 
     // Identidad del paquete: tile(24b) comp(3b) level(4b) py(11b) px(11b) layer(8b)

@@ -23,6 +23,7 @@ run com.cc8.server.protocol.HilbertSelfTest
 run com.cc8.server.ws.WebSocketSelfTest
 run com.cc8.server.protocol.TransportSelfTest
 run com.cc8.server.protocol.IntegrationSelfTest
+run com.cc8.server.protocol.SchedulerOrderTest images/sample.h2k
 run com.cc8.server.protocol.SchedulerForgetTest images/sample.h2k
 
 echo

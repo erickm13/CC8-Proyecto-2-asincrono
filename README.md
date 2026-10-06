@@ -98,5 +98,6 @@ Navegador (public/)                         Servidor (Java, src/)
 | `WebSocketSelfTest` | handshake (ejemplo RFC 6455) + frames |
 | `TransportSelfTest` | entrega 100% bajo pérdida 10–30% (SACK, congestión) |
 | `IntegrationSelfTest` | scheduler→transporte→reconstrucción sin pérdida |
+| `SchedulerOrderTest` | orden del scheduler: resolución + capa + utilidad/byte (rate-distortion) |
 | `SchedulerForgetTest` | ciclo LRU olvido→reenvío |
 | `RapidClientTest`, `test/js_verify.mjs`, `test/forget_verify.mjs` | end-to-end sobre WebSocket real |

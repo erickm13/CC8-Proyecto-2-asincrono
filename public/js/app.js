@@ -246,12 +246,13 @@ function sendViewport() {
     const vy = Math.max(0, Math.floor(view.offsetY));
     const vw = Math.min(header.width - vx, Math.ceil(canvas.width / view.scale));
     const vh = Math.min(header.height - vy, Math.ceil(canvas.height / view.scale));
-    // Si la vista abarca demasiados tiles (muy alejado), basta el overview: no
-    // pedimos tiles para no enumerar/transferir decenas de miles.
+    // Si hay overview y la vista abarca demasiados tiles (muy alejado), basta el
+    // overview: no pedimos tiles. Sin overview, dejamos pedir (el servidor topa
+    // la enumeración) para no quedarnos en blanco.
     const ts = header.tileSize;
     const ntx = Math.floor((vx + vw - 1) / ts) - Math.floor(vx / ts) + 1;
     const nty = Math.floor((vy + vh - 1) / ts) - Math.floor(vy / ts) + 1;
-    if (ntx * nty > REQUEST_TILES_CAP) return;
+    if (overviewBitmap && ntx * nty > REQUEST_TILES_CAP) return;
 
     // Nivel de resolución necesario según el zoom (no pedir detalle innecesario).
     const maxLevel = clamp(Math.round(header.levels + Math.log2(view.scale)) + 1, 0, header.levels);

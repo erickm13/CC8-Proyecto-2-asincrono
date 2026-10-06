@@ -43,6 +43,7 @@ public final class Main {
             H2kReader reader = new H2kReader(imagePath);
             H2kFormat.Header h = reader.header();
             router.get("/api/manifest", req -> HttpResponse.ok()
+                    .header("Cache-Control", "no-store")
                     .body(manifestJson(h, imagePath).getBytes(java.nio.charset.StandardCharsets.UTF_8),
                             "application/json; charset=utf-8"));
             router.get("/api/overview", req -> {
@@ -50,7 +51,8 @@ public final class Main {
                 if (png == null) {
                     return HttpResponse.notFound();
                 }
-                return HttpResponse.ok().body(png, "image/png");
+                return HttpResponse.ok().header("Cache-Control", "no-store")
+                        .body(png, "image/png");
             });
             server.upgrade(new WebSocketEndpoint("/stream", new ImageProtocolHandler(reader)));
             System.out.printf("Imagen cargada: %s  (%dx%d, %d componentes, %d niveles)%n",

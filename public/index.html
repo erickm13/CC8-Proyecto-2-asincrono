@@ -13,12 +13,32 @@
             <span class="sub">Reliable Adaptive Progressive Image Delivery · CC VIII</span>
         </div>
         <div class="controls">
+            <label for="mode">Modo RAPID</label>
+            <select id="mode" aria-label="Modo RAPID">
+                <option value="0">RAPID Progresivo (Hilbert)</option>
+                <option value="1">RAPID Cobertura EDF</option>
+                <option value="2">RAPID Predictivo DRR</option>
+            </select>
             <button id="fit">Ajustar</button>
             <span>Estado: <b id="status">iniciando…</b></span>
         </div>
     </header>
 
     <div id="stats">esperando datos…</div>
+
+    <details id="latency" class="latency">
+        <summary>Diagnóstico de latencia del cliente</summary>
+        <dl class="latency-grid">
+            <div><dt>VIEWPORT → primer paquete cuyo tile cruza la vista (aprox.)</dt><dd id="latency-viewport-packet">n/a</dd></div>
+            <div><dt>último cambio de vista → VIEWPORT enviado</dt><dd id="latency-view-change-send">n/a</dd></div>
+            <div><dt>Recepción del paquete → inflate listo</dt><dd id="latency-receive-inflate">n/a</dd></div>
+            <div><dt>Inflate listo → inicio de reconstrucción de tile visible</dt><dd id="latency-ready-reconstruct">n/a</dd></div>
+            <div><dt>Reconstrucción de tile visible</dt><dd id="latency-reconstruction">n/a</dd></div>
+            <div><dt>Duración de la llamada draw()</dt><dd id="latency-draw">n/a</dd></div>
+            <div><dt>VIEWPORT → primer drawImage() de tile reconstruido con paquete posterior (aprox.)</dt><dd id="latency-viewport-draw">n/a</dd></div>
+        </dl>
+        <p class="latency-note">Los siete valores son medianas de las últimas 64 muestras; n indica el total desde el último reinicio de sesión o cambio de modo. Los tiempos usan performance.now(). VIEWPORT es aproximado porque los paquetes no identifican su solicitud; draw() mide la llamada del cliente, no la presentación en pantalla. El tiempo hasta enviar usa solo la última llamada a scheduleViewport(); excluye el envío inicial y el de decaimiento del paneo. Una solicitud deduplicada o cubierta por el overview no añade una muestra.</p>
+    </details>
 
     <canvas id="view"></canvas>
 

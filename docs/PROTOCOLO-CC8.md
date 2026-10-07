@@ -3,7 +3,8 @@
 **Documento de especificación del protocolo — Proyecto 2 · Ciencias de la Computación VIII (Redes)**
 
 Autor: **Erick Eleazar Mejía Moscoso**
-Lenguaje del servidor: **Java 21** · Cliente: **HTML/CSS/JS** · Sin dependencias externas.
+Servidor: **Java 21** · Cliente: **HTML/CSS/JS** · Sin dependencias externas en
+ejecución. El preprocesamiento ZIP opcional requiere `libvips`.
 
 ---
 
@@ -19,8 +20,8 @@ El protocolo se divide en dos planos:
 
 | Plano | Responsabilidad | Sección |
 |-------|-----------------|---------|
-| **Sustrato de imagen** (`.h2k`) | *Qué información existe*: descompone la imagen en niveles de resolución, precincts y capas de calidad (base, no puntúa por sí sola). | §3 |
-| **Transporte RAPID** | *Cómo se transmite de forma confiable y eficiente*: ventana deslizante, SEQ/ACK/**SACK**, **Selective Repeat**, **slow start** + control de congestión y de flujo. | §4–§8 |
+| **Sustrato de imagen** (H2K o Deep Zoom ZIP) | *Qué información existe*: H2K ofrece niveles, precincts y capas de calidad; ZIP ofrece tiles PNG por niveles de resolución. | §3 |
+| **Transporte RAPID** | *Cómo se transmite de forma confiable y eficiente*: ventana deslizante, SEQ/ACK/**SACK**, **Selective Repeat**, modos de scheduler, control de flujo y despacho justo entre sesiones. | §4–§8 |
 
 El transporte adapta los mecanismos de **TCP (RFC 9293)** al plano de aplicación,
 corriendo **sobre WebSocket (RFC 6455)**. La comunicación inicial (HTML, JS, CSS)
@@ -37,8 +38,8 @@ esto con **transferencia y eliminación selectiva de información**:
 
 - Se transmite primero una versión **borrosa pero completa** y se **refina** la zona
   visible conforme el usuario la observa (aumento de resolución = *más* datos).
-- Al alejarse, el cliente **descarta** las capas finas que ya no necesita (disminución
-  de resolución = *eliminación* de datos y liberación de memoria).
+- Cuando necesita liberar caché, el cliente **desaloja tiles completos** y notifica al
+  servidor con `FORGET`; la selección de paquetes sigue siendo progresiva.
 - La entrega es **confiable, controlada y priorizada**: nunca se deja al usuario
   desatendido en la zona que solicita a máxima definición.
 
@@ -52,10 +53,10 @@ transferencia y eliminación real de información gobernada por el protocolo.
 ```
         NAVEGADOR (cliente)                     SERVIDOR (Java, asíncrono)
   ┌─────────────────────────────┐        ┌───────────────────────────────┐
-  │  UI: canvas, zoom/pan        │        │  Preprocesador  imagen → .h2k  │
-  │  Decodificador (inverse DWT) │        │  H2kReader (acceso aleatorio)  │
-  │  Receptor RAPID (ACK/SACK)   │        │  Scheduler (Hilbert+utilidad)  │
-  │  Caché LRU de paquetes       │        │  Emisor RAPID (ventana, cc)    │
+  │  UI: canvas, zoom/pan        │        │  Preprocesador H2K / libvips  │
+  │  DWT o decodificador PNG     │        │  H2kReader / ZipPyramidReader │
+  │  Receptor RAPID (ACK/SACK)   │        │  Scheduler (tres modos RAPID)  │
+  │  Caché LRU de tiles          │        │  Emisor RAPID (ventana, cc)    │
   └──────────────┬──────────────┘        └───────────────┬───────────────┘
                  │  Frames binarios RAPID (DATA / ACK / control)
                  │  ─────────────  WebSocket (RFC 6455)  ─────────────
@@ -72,29 +73,24 @@ transferencia y eliminación real de información gobernada por el protocolo.
    responde `101 Switching Protocols` (handshake RFC 6455).
 3. A partir de ahí corre **RAPID** en frames binarios de WebSocket.
 
-### 2.1 ¿Por qué implementar ARQ sobre WebSocket si TCP ya es confiable?
+### 2.1 ¿Qué aporta RAPID sobre WebSocket/TCP?
 
-Decisión de diseño central y justificable:
+WebSocket usa un único flujo TCP ordenado. Si TCP espera bytes perdidos o retrasados,
+los mensajes WebSocket posteriores también esperan; RAPID no evita ese bloqueo ni
+puede entregar frames fuera del orden del flujo.
 
-- **WebSocket es un único flujo ordenado** → sufre *head-of-line blocking*: si un
-  paquete de imagen tarda, bloquea a todos los que van detrás aunque ya estén listos.
-- RAPID trocea la imagen en **paquetes independientes con número de secuencia** y,
-  con **SACK + Selective Repeat**, el cliente confirma fuera de orden y el servidor
-  **reprioriza al instante** cuando el usuario cambia de zona (TCP no puede: reordena
-  y espera). Es el mismo principio con que **QUIC** evita el head-of-line sobre UDP;
-  RAPID hace el análogo sobre WebSocket.
-- **Control de flujo propio (`rwnd`)**: el cliente anuncia cuánta memoria/caché tiene,
-  y el servidor nunca la excede → no se satura el navegador.
-- **Retransmisión con sentido de aplicación**: cuando el cliente **desaloja** un
-  paquete de su caché (LRU) y vuelve a necesitarlo, es una "pérdida" a nivel de
-  aplicación que Selective Repeat recupera pidiéndolo de nuevo.
+RAPID añade identidad y ACK/SACK por DATA, con reintento selectivo a nivel de
+aplicación para DATA no confirmados. En producción, TCP sigue recuperando la pérdida
+de red; RAPID no la observa directamente ni puede adelantar mensajes en el flujo.
+RAPID sí prioriza datos aún no enviados cuando cambia el viewport y expone presión de
+caché mediante `rwnd` y `FORGET`. Las pruebas de pérdida usan un enlace simulado.
 
 ---
 
-## 3. Sustrato de imagen: formato `.h2k` (la base)
+## 3. Sustratos de imagen: H2K v1 y Deep Zoom ZIP
 
-> *Esta capa es la base necesaria para poder servir solo la zona/nivel visible.
-> No constituye el aporte del protocolo, pero se documenta para completar el diseño.*
+> *H2K v1 es el formato original y permanece sin cambios. Las subsecciones 3.1–3.3
+> describen su representación; §3.4 documenta la alternativa ZIP Deep Zoom.*
 
 ### 3.1 Descomposición
 
@@ -167,22 +163,39 @@ está alejada, y solo solicita tiles por WebSocket cuando el usuario se acerca l
 suficiente. Así, explorar una imagen de 93 GB nunca enumera sus decenas de miles de
 tiles: la vista alejada usa el overview; la cercana, unos pocos tiles.
 
+### 3.4 Pirámide Deep Zoom PNG en ZIP
+
+`preprocess_vips.sh entrada.png salida.zip` usa el comando `vips` de libvips
+para generar un ZIP (incluido ZIP64) con descriptor DZI y tiles PNG sin pérdida.
+El lector Java usa `ZipFile` para acceder al archivo sin extraerlo. La configuración
+predeterminada usa tiles de 512 px, `overlap=0`, `depth=onetile`, PNG compression
+0 y ZIP sin compresión externa; `--tile-size=N` y `--png-compression=0..9`
+permiten ajustar la salida. El comando `vips` debe estar en `PATH` o definirse
+con `VIPS_BIN`.
+
+El nivel 0 es un único tile de overview servido por `GET /api/overview`. El servidor
+indexa las entradas del ZIP para leer tiles por nivel y coordenadas; el cliente
+ensambla cada PNG al recibir todos sus fragmentos. Esta representación
+ofrece niveles de resolución, pero no las capas de calidad por bit-plane de H2K.
+H2K v1 sigue sin cambios y ambos formatos funcionan con las tres políticas RAPID.
+Cambiar el modo no requiere regenerar la imagen.
+
 ---
 
 ## 4. Transporte RAPID: modelo general
 
 - **Dirección de datos:** servidor → cliente (mensajes **DATA**). El cliente confirma
   con **ACK** (acumulativo + SACK) y anuncia su ventana de recepción.
-- **Unidad de secuencia:** el **segmento** (un DATA = un paquete de imagen
-  autodescriptivo). A diferencia de TCP (secuencia por byte), RAPID numera por
-  segmento, lo que simplifica SACK y Selective Repeat sin perder generalidad.
+- **Unidad de secuencia:** un frame **DATA**. Puede contener un paquete H2K, un
+  fragmento ZIP `ZT`, o en modos por lotes hasta 16 unidades de imagen. ACK/SACK,
+  retransmisión y secuencia cuentan DATA, no los elementos del lote.
 - **Espacio de secuencia:** entero de 32 bits, monótono creciente dentro de una
-  sesión. Una sesión de 93 GB con paquetes de pocos KB usa ≈ 2·10⁷ segmentos, muy
-  por debajo de 2³¹ (no hay *wrap-around*).
-- **Entrega a la aplicación:** en **orden de llegada** (no estricto). Como cada
-  payload es autodescriptivo, el cliente lo pinta apenas llega → evita el
-  head-of-line blocking. El receptor deduplica y, en paralelo, mantiene el estado
-  acumulativo/SACK para el control de retransmisión.
+  sesión; en los modos por lotes, cada secuencia identifica el DATA completo, no cada
+  paquete que contiene.
+- **Entrega a la aplicación:** WebSocket entrega sus mensajes en el orden del flujo
+  TCP. Al recibir un DATA, el cliente puede procesar sus paquetes autodescriptivos;
+  RAPID mantiene ACK/SACK por DATA y reprioriza datos aún no enviados, pero no evita
+  el head-of-line blocking de TCP.
 
 ---
 
@@ -195,12 +208,12 @@ viajan como *payload* de un frame binario de WebSocket.
 
 | Tipo | Valor | Dirección | Propósito |
 |------|:-----:|-----------|-----------|
-| `HELLO` | 1 | C → S | Abrir sesión: imagen solicitada, `rwnd` inicial, versión |
-| `DATA` | 2 | S → C | Segmento de datos (paquete de imagen) |
+| `HELLO` | 1 | C → S | Negociar versión y modo |
+| `DATA` | 2 | S → C | Segmento de datos; puede contener un lote |
 | `ACK` | 3 | C → S | ACK acumulativo + SACK + `rwnd` + eco de timestamp |
 | `VIEWPORT` | 4 | C → S | Cambio de zona/zoom visibles (repriorización) |
-| `WIN` | 5 | C → S | Actualización de ventana de recepción (flow control) |
-| `FORGET` | 6 | C → S | El cliente desalojó tiles de su caché (LRU) → reenviarlos si reaparecen |
+| `WIN` | 5 | — | Reservado; la ventana se anuncia en ACK |
+| `FORGET` | 6 | C → S | El cliente desalojó tiles; el scheduler puede reprogramarlos si reaparecen |
 | `FIN` | 7 | ambos | Cierre ordenado de la sesión |
 
 ### 5.2 DATA (servidor → cliente)
@@ -218,9 +231,16 @@ viajan como *payload* de un frame binario de WebSocket.
 | `type` | u8 | 2 |
 | `seq` | u32 | Número de secuencia del segmento |
 | `sendTs` | u64 | Marca de tiempo de envío (ms). El cliente la refleja en el ACK para medir RTT |
-| `flags` | u8 | bit0 = **RETX** (retransmisión; telemetría) |
+| `flags` | u8 | bit0 = **RETX**; bit1 = **BATCH** (lote de paquetes) |
 | `payloadLen` | u16 | Longitud del payload |
-| `payload` | bytes | **Paquete de imagen** (§5.6) |
+| `payload` | bytes | Paquete H2K (§5.6), fragmento ZIP (§5.7), o lote `[longitud(u16), unidad]*` si está activo `BATCH` |
+
+El modo legacy deja `BATCH` apagado; los modos 1 y 2 habilitan el agrupamiento. Cada
+DATA marcado `BATCH` lleva hasta **16** unidades, cada longitud es `u16` big-endian y
+el payload no supera **32.768 bytes**. Una unidad que no cabe en el límite se envía
+sola. En ZIP, cada unidad es un fragmento `ZT` con hasta 16.000 bytes de PNG. ACK y
+rangos SACK siguen refiriéndose al `seq` de cada DATA; la retransmisión conserva
+su `seq`, flags y payload.
 
 ### 5.3 ACK (cliente → servidor)
 
@@ -248,28 +268,53 @@ viajan como *payload* de un frame binario de WebSocket.
 ### 5.4 VIEWPORT (cliente → servidor)
 
 ```
- type=4 │ x(u32) │ y(u32) │ w(u32) │ h(u32) │ zoom(u8)
+ type=4 │ x(u32) │ y(u32) │ w(u32) │ h(u32) │ zoom(u8) │ [dx(i8) │ dy(i8) │ confidence(u8)]
 ```
-Coordenadas de la zona visible en el sistema de la imagen y nivel de zoom deseado.
-Provoca **repriorización inmediata** en el scheduler (§7).
+La forma base ocupa **18 bytes** y contiene la zona visible y el nivel máximo de
+resolución. `RAPID Predictivo DRR` añade `dx`, `dy` y `confidence` para un total de
+**21 bytes**: dirección normalizada en `[-127,127]` y confianza en `[0,255]`. Un
+cambio de vista reconstruye la cola de paquetes pendientes.
 
-### 5.5 WIN / HELLO / FIN
+### 5.5 HELLO / FORGET / WIN / FIN
 
-- **WIN**: `type=5 │ rwnd(u32)` — actualización aislada de la ventana de recepción.
 - **FORGET**: `type=6 │ count(u16) │ [tile(u32)]*` — el cliente informa qué tiles
-  desalojó de su caché (LRU). El servidor los quita de su conjunto de
-  ya-enviados, de modo que se **retransmiten** cuando el tile vuelva al viewport.
-  Es la retransmisión con sentido de aplicación descrita en §2.1.
-- **HELLO**: `type=1 │ imageId(u16) │ rwnd0(u32) │ version(u8)` — abre la sesión.
+  desalojó de su caché (LRU). El servidor vuelve a hacer elegibles los paquetes de
+  esos tiles para un envío posterior.
+- **HELLO**: `type=1 │ version(u8) │ mode(u8)` — exactamente 3 bytes; modos `0..2`.
+  Versión `1` selecciona H2K; versión `2` selecciona ZIP Deep Zoom. H2K permite
+  omitir `HELLO` y conserva el modo legacy `0`; una sesión ZIP requiere HELLO v2.
+- **WIN** (`type=5`) está reservado; el cliente anuncia `rwnd` en cada ACK.
 - **FIN**: `type=7` — cierre ordenado.
 
-### 5.6 Payload de DATA: paquete de imagen (cabecera de aplicación)
+### 5.6 Payload H2K de DATA: paquete de imagen
 
 ```
- tile(u32) │ comp(u8) │ level(u8) │ py(u16) │ px(u16) │ layer(u8) │ dataLen(u16) │ deflate(bit-plane)…
+ tile(u32) │ comp(u8) │ level(u8) │ py(u16) │ px(u16) │ layer(u8) │ numPlanes(u8) │ numCoeffs(u32) │ dataLen(u16) │ deflate(bit-plane)…
 ```
-El cliente usa `(tile, comp, level, py, px, layer)` para colocar el plano de bits en
-el coeficiente correcto y reconstruir por inverse DWT.
+Cabecera de **18 bytes**, seguida por el plano comprimido. El cliente usa los campos
+de tile, componente, nivel, precinct y capa junto con `numPlanes` y `numCoeffs` para
+reconstruir por inverse DWT.
+
+### 5.7 Payload ZIP de DATA: fragmento de tile `ZT`
+
+Cada fragmento comienza con una cabecera de **22 bytes**; todos los enteros son
+big-endian. A continuación van hasta **16.000 bytes** contiguos del PNG del tile.
+
+| Offset | Campo | Tipo | Descripción |
+|-------:|-------|------|-------------|
+| 0 | `magic` | 2 bytes | ASCII `ZT` |
+| 2 | `version` | u8 | 1 |
+| 3 | `tileId` | u32 | Identificador RAPID del tile |
+| 7 | `level` | u8 | Nivel de resolución DZI |
+| 8 | `tx`, `ty` | u16, u16 | Coordenadas del tile dentro del nivel |
+| 12 | `part`, `parts` | u16, u16 | Índice desde 0 y cantidad de fragmentos |
+| 16 | `totalBytes` | u32 | Tamaño completo del PNG del tile |
+| 20 | `dataLen` | u16 | Bytes PNG en este fragmento |
+| 22 | `data` | bytes | Segmento PNG; máximo 16.000 bytes |
+
+El cliente reensambla por `tileId` y `part`, valida el tamaño total y decodifica el
+PNG cuando llegan todos los fragmentos. La confiabilidad y retransmisión siguen
+siendo las de DATA, con ACK/SACK por número de secuencia.
 
 ---
 
@@ -339,55 +384,33 @@ Valores iniciales: `cwnd = 1`, `ssthresh = 64` segmentos.
 
 ### 6.5 Control de flujo (flow control)
 
-El cliente **calcula `rwnd` dinámicamente** según su propio estado y lo anuncia en
-cada ACK. El servidor jamás pone en vuelo más de `rwnd` segmentos
-(`ventana = mín(cwnd, rwnd)`) → **protege al navegador** de saturación:
-
-```
- headroom  = (MAX_TILES − tiles_en_cache) / MAX_TILES      (0..1)
- backlog   = min(decodificaciones_pendientes / 64, 1)       (0..1)
- rwnd      = MIN_RWND + headroom·(1 − backlog)·(MAX_RWND − MIN_RWND)
-            (acotado a [MIN_RWND, MAX_RWND] = [8, 256] segmentos)
-```
-
-Cuando la caché está casi llena o hay mucho backlog de decodificación, `rwnd` se
-encoge y el servidor reduce el ritmo; al desalojar (LRU) o vaciar el backlog, `rwnd`
-sube y el flujo se recupera. Es un lazo de realimentación cerrado cliente↔servidor.
-(Verificado: con `rwnd = 4` el emisor nunca supera 4 segmentos en vuelo.)
+El cliente calcula `rwnd` según el headroom de caché y el backlog de decodificación,
+y lo anuncia en cada ACK. El rango es **8–256 DATA** en modo legacy y **1–16 DATA**
+en modos 1/2; cada DATA por lotes puede contener hasta 16 paquetes. En el modo 2 el
+headroom usa el límite de 256 MiB; los otros modos usan 160 tiles.
 
 ---
 
-## 7. ¿Qué enviar? Scheduler (deadline + rate-distortion + Hilbert)
+## 7. Modos de scheduler
 
-El control de congestión decide **cuántos** segmentos enviar; el **scheduler** decide
-**cuáles** y en **qué orden**, actuando como fuente del emisor. De `VIEWPORT
-(x,y,w,h,zoom)` se derivan los paquetes candidatos (tiles visibles + un anillo de
-prefetch, niveles hasta el zoom pedido, precincts, capas pendientes aún no enviadas)
-y se **ordenan** por una clave de 5 criterios (de más a menos prioritario):
+El selector del visor ofrece estos nombres y valores de `HELLO.mode`:
 
-| # | Criterio | Efecto |
-|---|----------|--------|
-| 1 | **deadline** (0 visible / 1 prefetch) | lo que se ve ahora va antes que la precarga de alrededores |
-| 2 | **resolución** (nivel ascendente) | la imagen aparece completa y borrosa y se va afinando |
-| 3 | **capa de calidad** (plano MSB→LSB) | progresión por calidad; garantiza planos **contiguos** por precinct (requisito del decodificador) |
-| 4 | **utilidad/byte** (descendente) | **rate-distortion**: entre precincts del mismo plano, primero el que más detalle aporta por byte |
-| 5 | **Hilbert** (tile, precinct) | desempate espacial: cobertura homogénea, regiones vecinas juntas (Hilbert, 1891) |
+| Modo | Política |
+|------|----------|
+| `0 — RAPID Progresivo (Hilbert)` | Legacy: progresión espacial por Hilbert, sin lotes. Una conexión que omite `HELLO` usa este modo. |
+| `1 — RAPID Cobertura EDF` | Prioriza nivel grueso visible, luego capa base visible y después el detalle; los tiles vecinos van al final. Mide vencimientos de envío de 250 ms para nivel grueso y 1000 ms para las demás capas base visibles, desde el último `VIEWPORT`. Con carga ≥0,7 difiere prefetch; con carga ≥0,85 difiere capas de detalle visibles. |
+| `2 — RAPID Predictivo DRR` | Prioriza nivel grueso y datos visibles; agrega una franja de un tile en la dirección del paneo. Confianza 0 no agrega franja; la confianza determina su extensión transversal. Un bucket de tokens limita el prefetch a 65.536 bytes, con reposición de 65.536 bytes/s. Con carga ≥0,7 difiere prefetch y con ≥0,85 difiere detalle visible. |
 
-**Utilidad/byte (criterio 4).** Para el plano de bits `p` de un precinct con `N`
-coeficientes y `B` bytes comprimidos:
-```
-utilidad(paquete) = N · 2^(2p) / B
-```
-El factor `2^(2p)` aproxima la reducción de **error cuadrático** al añadir ese plano
-(cada coeficiente reduce su incertidumbre a la mitad por plano); dividir entre `B`
-da la ganancia **por byte transmitido** (principio rate-distortion, análogo al PCRD
-de JPEG2000). Así, dentro de cada plano, los precincts más informativos (bordes,
-texto) se envían antes que las zonas planas.
+La carga es una estimación compartida que llega a 1 con 16 sesiones. Los vencimientos
+son contadores observables cuando el scheduler obtiene una capa base visible después
+de su plazo; son métricas de despacho, no garantías de latencia de red. Los tres
+modos funcionan con H2K y ZIP: cambiar el selector reabre la sesión y cambia la
+planificación, sin regenerar la imagen.
 
-Al cambiar el viewport, la cola se **reconstruye** al instante para la nueva zona
-(los paquetes ya enviados se excluyen); los que dejan de ser visibles simplemente no
-se re-encolan. La numeración por segmento independiente permite esta repriorización
-sin bloqueos.
+El dispatcher aplica **DRR por bytes entre todas las sesiones con trabajo pendiente**:
+cada ronda añade un quantum de hasta 32.832 bytes por sesión. La cola de escritura de
+cada sesión WebSocket admite como máximo **1 MiB**; al llenarse, difiere el envío sin
+consumir el siguiente número de secuencia.
 
 ---
 
@@ -396,7 +419,7 @@ sin bloqueos.
 ### 8.1 Estados de la sesión
 
 ```
-   CLOSED ──HELLO──► OPEN ──(streaming DATA/ACK, VIEWPORT/WIN)──► OPEN
+   CLOSED ──HELLO(v1/v2) o H2K legacy──► OPEN ──(DATA/ACK, VIEWPORT, FORGET)──► OPEN
                         │                                            │
                         └───────────────── FIN ──────────────────► CLOSING ─► CLOSED
 ```
@@ -409,17 +432,17 @@ sin bloqueos.
    │◄───────── 200 OK  ─────────────────────│
    │  GET /stream  Upgrade: websocket ─────►│
    │◄──────── 101 Switching Protocols ──────│
-   │  HELLO(img, rwnd0) ───────────────────►│
+   │  HELLO(version=1 H2K / 2 ZIP, mode) ──►│ (ZIP exige HELLO; H2K omite = modo 0)
    │  VIEWPORT(x,y,w,h,zoom) ──────────────►│  scheduler prioriza
-   │◄── DATA seq=0 (R0 completo, borroso) ──│  cwnd=1 (slow start)
+   │◄── DATA seq=0 (paquete o lote) ────────│  cwnd=1 (slow start)
    │  ACK ack=1, rwnd ─────────────────────►│  cwnd=2
    │◄── DATA seq=1,2 ───────────────────────│
    │  ACK ack=3 ───────────────────────────►│  cwnd=4 …
    │        … refinamiento progresivo …      │
-   │  VIEWPORT(nueva zona) ────────────────►│  cancela obsoletos, reprioriza
+   │  VIEWPORT(nueva zona) ────────────────►│  descarta candidato staged, reprioriza
    │◄── DATA de la nueva zona ──────────────│
    │  (desaloja de caché algo lejano)        │
-   │  VIEWPORT(vuelve) → re-solicita ──────►│  retransmite lo desalojado
+   │  FORGET(tile) + VIEWPORT(vuelve) ──────►│  vuelve a programar sus paquetes
 ```
 
 ### 8.3 Recuperación ante pérdida (Selective Repeat + SACK)
@@ -440,12 +463,11 @@ sin bloqueos.
 - **Todo el intercambio de imagen ocurre por WebSocket** → se evitan cientos de
   *requests* HTTP por tiles (validable en las herramientas del navegador: apenas un
   request de upgrade + una conexión persistente).
-- El cliente mantiene una **caché LRU** de tiles decodificados (límite configurable,
-  p.ej. 160 tiles). Al salir del viewport, los tiles menos usados se **desalojan**
-  (eliminación de información, se libera memoria) y se envía un `FORGET` con sus
-  índices. Si el usuario vuelve, el siguiente `VIEWPORT` hace que el servidor los
-  **retransmita** (verificado: tras `FORGET(0,1)` se reenvían exactamente los
-  paquetes de esos tiles).
+- El cliente limita la caché a 160 tiles con LRU en modos 0/1. En modo 2 la limita a
+  256 MiB y desaloja primero tiles con menor utilidad por byte (LRU desempata). Al
+  desalojar un tile envía `FORGET`; si vuelve a ser necesario, el scheduler lo
+  programa de nuevo. Esto es un nuevo envío de aplicación, distinto de una
+  retransmisión de DATA por pérdida.
 - Política de caché HTTP para los estáticos: `Cache-Control` en JS/CSS; los datos de
   imagen **no** se cachean por el navegador (van por el protocolo, no por `img`/HTTP).
 
@@ -468,9 +490,23 @@ el severo con 1000):
 a la pérdida (baja `ssthresh`/`cwnd`) y crece en ausencia de ella; Selective Repeat no
 retransmite de más cuando la red está ordenada.
 
-Otras pruebas unitarias: DWT reversible exacta; bit-planes con error monótono → 0 y
-reconstrucción sin pérdida del `.h2k`; handshake WebSocket coincidente con el ejemplo
-del RFC 6455.
+Otras pruebas unitarias cubren DWT, bit-planes, `.h2k`, WebSocket, transporte y
+scheduler. `RapidModesSchedulerTest`, `RapidSessionTest`, `test/client_modes_test.mjs`
+y `test/rapid_integration_test.java` cubren políticas de modos, lotes, cambio de modo,
+FORGET y progreso de dos sesiones. `run_vips_tests.sh` se ejecutó correctamente con
+un ZIP Deep Zoom de muestra en los tres modos; la suite `./run_tests.sh` también
+pasó con `VIPS_BIN` local. La integración ZIP reconstruyó los píxeles RGB exactos
+de un fixture de 1200×800 en los tres modos y verificó lotes, retransmisión y
+`FORGET`.
+
+Para `Imagen-55GB-comprimida/055-843-000-80450114.png` (**136.325 × 136.325 px**;
+**55.843.161.368 bytes**), libvips 8.15.1 generó `images/large_vips.zip` de
+**74.534.432.660 bytes** en **280 s** con `VIPS_CONCURRENCY=8`, PNG compression 0
+y tiles de 512 px. El ZIP contiene **95.301 entradas**. El lector Java abrió su
+ZIP64 y una prueba WebSocket recibió
+el mismo tile de borde de **53.366 bytes** en los modos 0/1/2, usando 70/34/33
+frames DATA. Esta fue una prueba acotada de un tile; no reconstruyó la imagen
+completa.
 
 ---
 
@@ -478,14 +514,20 @@ del RFC 6455.
 
 | Parámetro | Valor | Referencia |
 |-----------|-------|------------|
-| Tile | 512×512 | §3.1 |
+| Tile H2K | 512×512 | §3.1 |
 | Niveles de resolución (DWT) | 5 | §3.1 |
+| Tile ZIP predeterminado | 512×512, `overlap=0` | §3.4 |
+| HELLO de imagen | v1 H2K; v2 ZIP | §5.5 |
+| PNG bytes por fragmento `ZT` | ≤ 16.000 | §5.7 |
 | Precinct | 64×64 | §3.1 |
 | Umbral de ACK duplicados | 3 | §6.2 |
 | `ssthresh` inicial | 64 segmentos | §6.3 |
 | `cwnd` inicial | 1 segmento | §6.3 |
 | RTO | `[200 ms, 60 s]` | §6.4 |
 | Bloques SACK por ACK | ≤ 4 | §5.3 |
+| Paquetes por DATA en lote | ≤ 16 | §5.2 |
+| Payload máximo de lote | 32.768 bytes | §5.2 |
+| Cola WebSocket por sesión | 1 MiB | §7 |
 | Espacio de secuencia | u32 | §4 |
 
 ---
@@ -516,7 +558,6 @@ del RFC 6455.
 
 ---
 
-*Documento vivo: refleja el diseño e implementación de RAPID a la fecha. La capa de
-transporte está implementada y probada; la integración end-to-end (scheduler ↔
-WebSocket ↔ H2kReader) y el cliente de navegador están en desarrollo siguiendo esta
-especificación.*
+*Documento vivo: la implementación integra scheduler, transporte, WebSocket, acceso a
+`.h2k` y cliente de navegador. Las pruebas focalizadas listadas arriba cubren los
+modos actuales; consulte el README para ejecutar la suite completa.*

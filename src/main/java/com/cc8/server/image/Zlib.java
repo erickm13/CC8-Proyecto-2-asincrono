@@ -16,17 +16,31 @@ public final class Zlib {
     }
 
     public static byte[] deflate(byte[] input) {
-        Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION, true);
+        return deflate(input, Deflater.BEST_COMPRESSION);
+    }
+
+    public static byte[] deflate(byte[] input, int level) {
+        checkLevel(level);
+        Deflater deflater = new Deflater(level, true);
         deflater.setInput(input);
         deflater.finish();
         ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(32, input.length / 2));
         byte[] buf = new byte[8192];
-        while (!deflater.finished()) {
-            int n = deflater.deflate(buf);
-            out.write(buf, 0, n);
+        try {
+            while (!deflater.finished()) {
+                int n = deflater.deflate(buf);
+                out.write(buf, 0, n);
+            }
+        } finally {
+            deflater.end();
         }
-        deflater.end();
         return out.toByteArray();
+    }
+
+    static void checkLevel(int level) {
+        if (level < 0 || level > 9) {
+            throw new IllegalArgumentException("compression level must be 0..9: " + level);
+        }
     }
 
     public static byte[] inflate(byte[] input, int expectedSize) {

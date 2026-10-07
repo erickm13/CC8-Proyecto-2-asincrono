@@ -16,6 +16,7 @@ import java.util.ArrayDeque;
 public final class WebSocketSession {
 
     private static final int READ_BUFFER = 16 * 1024;
+    private static final int MAX_QUEUED_BYTES = 1 << 20;
 
     private final AsynchronousSocketChannel channel;
     private final WebSocketHandler handler;
@@ -29,6 +30,7 @@ public final class WebSocketSession {
     // Cola de escritura.
     private final Object writeLock = new Object();
     private final ArrayDeque<ByteBuffer> writeQueue = new ArrayDeque<>();
+    private int queuedBytes;
     private boolean writing = false;
     private volatile boolean closed = false;
 
@@ -48,7 +50,17 @@ public final class WebSocketSession {
     // ---- API de envio ----------------------------------------------------
 
     public void sendBinary(byte[] payload) {
-        enqueue(WebSocketFrame.binary(payload));
+        if (!trySendBinary(payload)) {
+            doClose();
+        }
+    }
+
+    /** Queues binary data when bounded writer capacity is available. */
+    public boolean trySendBinary(byte[] payload) {
+        if (payload.length > MAX_QUEUED_BYTES - 10) {
+            return false;
+        }
+        return tryEnqueue(WebSocketFrame.binary(payload));
     }
 
     public void sendText(String text) {
@@ -153,23 +165,34 @@ public final class WebSocketSession {
     // ---- Escritura serializada ------------------------------------------
 
     private void enqueue(byte[] frameBytes) {
-        if (closed) {
-            return;
-        }
+        if (!tryEnqueue(frameBytes)) doClose();
+    }
+
+    private boolean tryEnqueue(byte[] frameBytes) {
         ByteBuffer buf = ByteBuffer.wrap(frameBytes);
         synchronized (writeLock) {
+            if (closed || frameBytes.length > MAX_QUEUED_BYTES - queuedBytes) {
+                return false;
+            }
             writeQueue.add(buf);
+            queuedBytes += frameBytes.length;
             if (writing) {
-                return;
+                return true;
             }
             writing = true;
         }
         writeNext();
+        return true;
     }
 
     private void writeNext() {
+        if (closed) return;
         ByteBuffer buf;
         synchronized (writeLock) {
+            if (closed) {
+                writing = false;
+                return;
+            }
             buf = writeQueue.peek();
             if (buf == null) {
                 writing = false;
@@ -184,7 +207,10 @@ public final class WebSocketSession {
                     return;
                 }
                 synchronized (writeLock) {
-                    writeQueue.poll();
+                    if (writeQueue.peek() == buf) {
+                        writeQueue.poll();
+                        queuedBytes -= buf.capacity();
+                    }
                 }
                 writeNext();
             }
@@ -197,10 +223,15 @@ public final class WebSocketSession {
     }
 
     private void doClose() {
-        if (closed) {
-            return;
+        synchronized (writeLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            writeQueue.clear();
+            queuedBytes = 0;
+            writing = false;
         }
-        closed = true;
         try {
             channel.close();
         } catch (Exception ignored) {

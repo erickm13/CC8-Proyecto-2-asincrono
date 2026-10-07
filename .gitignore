@@ -6,6 +6,9 @@ sources.txt
 # Artefactos generados por preprocesamiento / pruebas
 images/*.h2k
 images/*.png
+images/*.zip
+images/.vips-rapid.*/
+.vips-runtime/
 demo/
 tmp_ingest/
 *.ppm
@@ -22,3 +25,7 @@ tmp_ingest/
 *.swp
 .idea/
 .vscode/
+
+# codex-workflow-managed-start
+.codex_workflow_hidden_resources/
+# codex-workflow-managed-end

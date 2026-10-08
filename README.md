@@ -152,5 +152,7 @@ Navegador (public/)                         Servidor (Java, src/)
 | `IntegrationSelfTest` | scheduler→transporte→reconstrucción sin pérdida |
 | `SchedulerOrderTest` | orden del scheduler: resolución + capa + utilidad/byte (rate-distortion) |
 | `SchedulerForgetTest` | ciclo LRU olvido→reenvío |
+| `RapidModesSchedulerTest` | orden y FORGET en los modos 1 (EDF) y 2 (Predictivo DRR) |
+| `RapidSessionTest` | sesión en vivo: retransmit/FORGET/orden, reconstrucción en modos 0–2, cambio de modo, lotes y dos sesiones |
 | `RapidClientTest`, `test/js_verify.mjs`, `test/forget_verify.mjs` | end-to-end sobre WebSocket real |
 | `run_vips_tests.sh`, `ZipPyramidIntegrationTest`, `test/zip_client_test.mjs` | ZIP Deep Zoom generado con libvips y tres modos RAPID |

@@ -1,5 +1,7 @@
 package com.cc8.server.image;
 
+import java.util.zip.Deflater;
+
 /**
  * Codificacion de coeficientes wavelet (con signo) por planos de bits, con
  * signo perezoso: el bit de signo se emite en el plano en que el coeficiente
@@ -32,6 +34,11 @@ public final class BitPlaneCoder {
      * Cada paquete ya viene comprimido con DEFLATE.
      */
     public static byte[][] encode(int[] coeffs, int numPlanes) {
+        return encode(coeffs, numPlanes, Deflater.BEST_COMPRESSION);
+    }
+
+    public static byte[][] encode(int[] coeffs, int numPlanes, int compressionLevel) {
+        Zlib.checkLevel(compressionLevel);
         int n = coeffs.length;
         boolean[] significant = new boolean[n];
         byte[][] layers = new byte[numPlanes][];
@@ -48,7 +55,7 @@ public final class BitPlaneCoder {
                     bw.writeBit(coeffs[i] < 0 ? 1 : 0);
                 }
             }
-            layers[layer] = Zlib.deflate(bw.toBytes());
+            layers[layer] = Zlib.deflate(bw.toBytes(), compressionLevel);
         }
         return layers;
     }

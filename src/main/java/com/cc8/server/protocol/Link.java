@@ -10,4 +10,10 @@ package com.cc8.server.protocol;
 @FunctionalInterface
 public interface Link {
     void send(byte[] datagram);
+
+    /** Returns false when the receiver queue is full; existing links accept by default. */
+    default boolean trySend(byte[] datagram) {
+        send(datagram);
+        return true;
+    }
 }

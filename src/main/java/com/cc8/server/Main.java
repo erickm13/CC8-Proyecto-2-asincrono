@@ -6,6 +6,7 @@ import com.cc8.server.http.HttpResponse;
 import com.cc8.server.http.HttpServer;
 import com.cc8.server.image.H2kFormat;
 import com.cc8.server.image.H2kReader;
+import com.cc8.server.image.ZipPyramidReader;
 import com.cc8.server.protocol.ImageProtocolHandler;
 import com.cc8.server.ws.WebSocketEndpoint;
 
@@ -24,7 +25,7 @@ import java.nio.file.Paths;
  *   <li>{@code /stream} WebSocket con el protocolo RAPID.</li>
  * </ul>
  *
- * Uso: java com.cc8.server.Main [puerto] [webroot] [imagen.h2k]
+ * Uso: java com.cc8.server.Main [puerto] [webroot] [imagen.h2k|piramide.zip]
  */
 public final class Main {
 
@@ -40,31 +41,64 @@ public final class Main {
         HttpServer server = new HttpServer(port, router);
 
         if (Files.exists(imagePath)) {
-            H2kReader reader = new H2kReader(imagePath);
-            H2kFormat.Header h = reader.header();
-            router.get("/api/manifest", req -> HttpResponse.ok()
-                    .header("Cache-Control", "no-store")
-                    .body(manifestJson(h, imagePath).getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                            "application/json; charset=utf-8"));
-            router.get("/api/overview", req -> {
-                byte[] png = reader.overviewPng();
-                if (png == null) {
-                    return HttpResponse.notFound();
-                }
-                return HttpResponse.ok().header("Cache-Control", "no-store")
-                        .body(png, "image/png");
-            });
-            server.upgrade(new WebSocketEndpoint("/stream", new ImageProtocolHandler(reader)));
-            System.out.printf("Imagen cargada: %s  (%dx%d, %d componentes, %d niveles)%n",
-                    imagePath, h.width(), h.height(), h.components(), h.levels());
+            if (imagePath.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".zip")) {
+                ZipPyramidReader reader = new ZipPyramidReader(imagePath);
+                router.get("/api/manifest", req -> HttpResponse.ok()
+                        .header("Cache-Control", "no-store")
+                        .body(zipManifestJson(reader, imagePath).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                "application/json; charset=utf-8"));
+                router.get("/api/overview", req -> HttpResponse.ok()
+                        .header("Cache-Control", "no-store")
+                        .body(reader.overviewPng(), "image/png"));
+                server.upgrade(new WebSocketEndpoint("/stream", new ImageProtocolHandler(reader)));
+                System.out.printf("Piramide ZIP cargada: %s (%dx%d, tile=%d, nivel maximo=%d)%n",
+                        imagePath, reader.width(), reader.height(), reader.tileSize(), reader.maxLevel());
+            } else {
+                H2kReader reader = new H2kReader(imagePath);
+                H2kFormat.Header h = reader.header();
+                router.get("/api/manifest", req -> HttpResponse.ok()
+                        .header("Cache-Control", "no-store")
+                        .body(manifestJson(h, imagePath).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                "application/json; charset=utf-8"));
+                router.get("/api/overview", req -> {
+                    byte[] png = reader.overviewPng();
+                    if (png == null) {
+                        return HttpResponse.notFound();
+                    }
+                    return HttpResponse.ok().header("Cache-Control", "no-store")
+                            .body(png, "image/png");
+                });
+                server.upgrade(new WebSocketEndpoint("/stream", new ImageProtocolHandler(reader)));
+                System.out.printf("Imagen cargada: %s  (%dx%d, %d componentes, %d niveles)%n",
+                        imagePath, h.width(), h.height(), h.components(), h.levels());
+            }
         } else {
-            System.out.printf("AVISO: no existe %s. Genera un .h2k con Preprocessor. "
+            System.out.printf("AVISO: no existe %s. Genera un .h2k o ZIP con libvips. "
                     + "El sitio se sirve, pero /stream y /api/manifest estan inactivos.%n", imagePath);
         }
 
         router.fallback(staticFiles); // todo lo demas: archivos del sitio
         server.start();
         server.awaitTermination();
+    }
+
+    private static String zipManifestJson(ZipPyramidReader reader, Path path) {
+        return "{"
+                + "\"format\":\"vips-zip\","
+                + "\"name\":\"" + path.getFileName() + "\","
+                + "\"width\":" + reader.width() + ","
+                + "\"height\":" + reader.height() + ","
+                + "\"components\":3,"
+                + "\"tileSize\":" + reader.tileSize() + ","
+                + "\"levels\":" + reader.maxLevel() + ","
+                + "\"precinct\":" + reader.tileSize() + ","
+                + "\"tilesX\":" + reader.tilesX(reader.maxLevel()) + ","
+                + "\"tilesY\":" + reader.tilesY(reader.maxLevel()) + ","
+                + "\"overviewW\":" + reader.width(0) + ","
+                + "\"overviewH\":" + reader.height(0) + ","
+                + "\"overviewScale\":" + (1L << reader.maxLevel()) + ","
+                + "\"hasOverview\":true"
+                + "}";
     }
 
     private static String manifestJson(H2kFormat.Header h, Path path) {

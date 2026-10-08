@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compila y ejecuta el servidor. Uso: ./run.sh [puerto] [webroot] [imagen.h2k]
+# Compila y ejecuta el servidor. Uso: ./run.sh [puerto] [webroot] [imagen.h2k|imagen.zip]
 set -e
 cd "$(dirname "$0")"
 ./compile.sh

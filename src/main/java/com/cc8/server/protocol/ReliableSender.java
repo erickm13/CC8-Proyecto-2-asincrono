@@ -2,6 +2,8 @@ package com.cc8.server.protocol;
 
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.LongSupplier;
 
 /**
@@ -30,18 +32,26 @@ public final class ReliableSender {
     private static final long MIN_RTO = 200;
     private static final long MAX_RTO = 60_000;
     private static final int DUP_ACK_THRESHOLD = 3;
+    private static final int MAX_SACK_RETRANSMITS_PER_ACK = 4;
 
     private final Link toReceiver;
     private final SegmentSource source;
     private final LongSupplier clock;
+    private final boolean autoPump;
+    private boolean batchingEnabled;
+    private byte[] stagedPayload;
+    private boolean stagedBatch;
+    private byte[] overflowPayload;
 
     /** Segmento sin confirmar (guardamos el payload para poder retransmitir). */
     private static final class Unacked {
         final byte[] payload;
+        final boolean batch;
         boolean retransmitted;
         long lastSent;
-        Unacked(byte[] payload, long lastSent) {
+        Unacked(byte[] payload, boolean batch, long lastSent) {
             this.payload = payload;
+            this.batch = batch;
             this.lastSent = lastSent;
         }
     }
@@ -71,9 +81,16 @@ public final class ReliableSender {
     private long sent = 0, retransmits = 0, timeouts = 0, fastRetx = 0;
 
     public ReliableSender(Link toReceiver, SegmentSource source, LongSupplier clock) {
+        this(toReceiver, source, clock, true);
+    }
+
+    /** Allows a shared dispatcher to control new data while retaining the default standalone behavior. */
+    public ReliableSender(Link toReceiver, SegmentSource source, LongSupplier clock,
+                          boolean autoPump) {
         this.toReceiver = toReceiver;
         this.source = source;
         this.clock = clock;
+        this.autoPump = autoPump;
     }
 
     // ---- Ventana ---------------------------------------------------------
@@ -90,7 +107,46 @@ public final class ReliableSender {
 
     /** ¿Termino? Sin nada en buffer y la fuente no tiene mas. */
     public boolean isDone() {
-        return buffer.isEmpty() && !source.hasNext();
+        return buffer.isEmpty() && stagedPayload == null && overflowPayload == null
+                && !source.hasNext();
+    }
+
+    public void setBatchingEnabled(boolean enabled) {
+        batchingEnabled = enabled;
+    }
+
+    /** Requeues prepared but untransmitted image packets before the source rebuilds its queue. */
+    public void discardStaged() {
+        if (stagedPayload != null) {
+            if (stagedBatch) {
+                for (byte[] packet : Wire.decodeBatch(stagedPayload)) {
+                    source.requeueUnsent(packet);
+                }
+            } else {
+                source.requeueUnsent(stagedPayload);
+            }
+        }
+        if (overflowPayload != null) {
+            source.requeueUnsent(overflowPayload);
+        }
+        stagedPayload = null;
+        stagedBatch = false;
+        overflowPayload = null;
+    }
+
+    /** True when new data can enter the current congestion and receive window. */
+    public boolean canPump() {
+        return inFlight() < window()
+                && (stagedPayload != null || overflowPayload != null || source.hasNext());
+    }
+
+    /** Encoded DATA datagram size for the next payload, staging it if necessary. */
+    public int nextWireBytes() {
+        if (!canPump()) {
+            return 0;
+        }
+        preparePayload();
+        return stagedPayload == null ? 0 : Wire.DATA_HEADER_SIZE + stagedPayload.length;
     }
 
     /** Instante del proximo vencimiento de RTO, o Long.MAX_VALUE si no hay. */
@@ -102,32 +158,93 @@ public final class ReliableSender {
 
     /** Envia nuevos segmentos mientras la ventana y la fuente lo permitan. */
     public void pump() {
-        long now = clock.getAsLong();
-        while (inFlight() < window() && source.hasNext()) {
-            byte[] payload = source.next();
-            if (payload == null) {
-                break;
-            }
-            int seq = sndNxt++;
-            buffer.put(seq, new Unacked(payload, now));
-            transmit(seq, now, false);
-            startTimerIfIdle(now);
-        }
+        while (pumpOne(Integer.MAX_VALUE) > 0) { }
     }
 
-    private void transmit(int seq, long now, boolean isRetx) {
-        Unacked u = buffer.get(seq);
-        if (u == null) {
+    /** Sends at most one DATA datagram, and only when it fits the byte allowance. */
+    public int pumpOne(int byteAllowance) {
+        if (!canPump()) {
+            return 0;
+        }
+        preparePayload();
+        if (stagedPayload == null) {
+            return 0;
+        }
+        int bytes = Wire.DATA_HEADER_SIZE + stagedPayload.length;
+        if (bytes > byteAllowance) {
+            return 0;
+        }
+        long now = clock.getAsLong();
+        int seq = sndNxt;
+        buffer.put(seq, new Unacked(stagedPayload, stagedBatch, now));
+        if (!transmit(seq, now, false)) {
+            buffer.remove(seq);
+            return 0;
+        }
+        sndNxt++;
+        stagedPayload = null;
+        stagedBatch = false;
+        startTimerIfIdle(now);
+        return bytes;
+    }
+
+    private void preparePayload() {
+        if (stagedPayload != null) {
             return;
         }
+        byte[] first = takeNextPayload();
+        if (first == null) {
+            return;
+        }
+        if (!batchingEnabled || first.length + 2 > Wire.MAX_BATCH_PAYLOAD) {
+            stagedPayload = first;
+            return;
+        }
+
+        List<byte[]> packets = new ArrayList<>(Wire.MAX_BATCH_PACKETS);
+        packets.add(first);
+        int size = first.length + 2;
+        while (packets.size() < Wire.MAX_BATCH_PACKETS && source.hasNext()) {
+            byte[] packet = source.next();
+            if (packet == null) {
+                break;
+            }
+            if (size + packet.length + 2 > Wire.MAX_BATCH_PAYLOAD) {
+                overflowPayload = packet;
+                break;
+            }
+            packets.add(packet);
+            size += packet.length + 2;
+        }
+        stagedPayload = Wire.encodeBatch(packets);
+        stagedBatch = true;
+    }
+
+    private byte[] takeNextPayload() {
+        if (overflowPayload != null) {
+            byte[] payload = overflowPayload;
+            overflowPayload = null;
+            return payload;
+        }
+        return source.hasNext() ? source.next() : null;
+    }
+
+    private boolean transmit(int seq, long now, boolean isRetx) {
+        Unacked u = buffer.get(seq);
+        if (u == null) {
+            return false;
+        }
+        int flags = (isRetx ? Wire.FLAG_RETX : 0) | (u.batch ? Wire.FLAG_BATCH : 0);
+        if (!toReceiver.trySend(Wire.encodeData(seq, now, flags, u.payload))) {
+            return false;
+        }
         u.lastSent = now;
-        int flags = isRetx ? Wire.FLAG_RETX : 0;
-        toReceiver.send(Wire.encodeData(seq, now, flags, u.payload));
         sent++;
         if (isRetx) {
             u.retransmitted = true;
             retransmits++;
         }
+        return true;
     }
 
     // ---- Recepcion de ACK ------------------------------------------------
@@ -135,6 +252,15 @@ public final class ReliableSender {
     public void onAck(byte[] datagram) {
         long now = clock.getAsLong();
         Wire.Ack a = Wire.decodeAck(datagram);
+        if (a.ack() < sndUna || a.ack() > sndNxt || a.rwnd() < 0) {
+            return;
+        }
+        for (int i = 0; i < a.sackStart().length; i++) {
+            if (a.sackStart()[i] < a.ack() || a.sackEnd()[i] <= a.sackStart()[i]
+                    || a.sackEnd()[i] > sndNxt) {
+                return;
+            }
+        }
         rwnd = a.rwnd();
 
         // Marcar segmentos confirmados selectivamente; muestrear RTT de los
@@ -158,7 +284,9 @@ public final class ReliableSender {
         }
 
         sackRetransmit(now);
-        pump();
+        if (autoPump) {
+            pump();
+        }
     }
 
     private void onNewAck(Wire.Ack a, long now) {
@@ -247,7 +375,7 @@ public final class ReliableSender {
             return;
         }
         int maxSacked = sacked.last();
-        int budget = window();
+        int budget = Math.min(window(), MAX_SACK_RETRANSMITS_PER_ACK);
         for (int seq = sndUna; seq < maxSacked && budget > 0; seq++) {
             if (sacked.contains(seq)) {
                 continue;
@@ -261,7 +389,9 @@ public final class ReliableSender {
             // retransmitir el mismo hueco mas de una vez por RTT.
             int sackedAbove = sacked.tailSet(seq + 1).size();
             if (sackedAbove >= DUP_ACK_THRESHOLD && (now - u.lastSent) > rto / 2) {
-                transmit(seq, now, true);
+                if (!transmit(seq, now, true)) {
+                    break;
+                }
                 budget--;
             }
         }
@@ -274,7 +404,9 @@ public final class ReliableSender {
         long now = clock.getAsLong();
         if (timerRunning && !buffer.isEmpty() && now >= rtoDeadline) {
             onTimeout(now);
-            pump();
+            if (autoPump) {
+                pump();
+            }
         }
     }
 

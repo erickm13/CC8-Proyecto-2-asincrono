@@ -1,6 +1,8 @@
 package com.cc8.server.protocol;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Formato binario de los segmentos del protocolo de transporte (big-endian).
@@ -15,7 +17,7 @@ import java.io.ByteArrayOutputStream;
  *   ACK :  type(1)=3 | ack(4) | rwnd(4) | echoTs(8) | nSack(1) | [start(4) end(4)]*
  *   Control (VIEWPORT/WIN/HELLO/FIN): definidos en la integracion.
  * </pre>
- * flags: bit0 = retransmision (informativo/telemetria).
+ * flags: bit0 = retransmision (informativo/telemetria), bit1 = lote de paquetes.
  */
 public final class Wire {
 
@@ -28,6 +30,10 @@ public final class Wire {
     public static final byte T_FIN = 7;
 
     public static final int FLAG_RETX = 0x01;
+    public static final int FLAG_BATCH = 0x02;
+    public static final int MAX_BATCH_PACKETS = 16;
+    public static final int MAX_BATCH_PAYLOAD = 32_768;
+    public static final int DATA_HEADER_SIZE = 16;
 
     private Wire() {
     }
@@ -51,6 +57,58 @@ public final class Wire {
         p = putShort(b, p, payload.length);
         System.arraycopy(payload, 0, b, p, payload.length);
         return b;
+    }
+
+    /** Empaqueta paquetes ImagePacket como [u16 len][packet] ... . */
+    public static byte[] encodeBatch(List<byte[]> packets) {
+        if (packets.isEmpty() || packets.size() > MAX_BATCH_PACKETS) {
+            throw new IllegalArgumentException("batch packet count out of range");
+        }
+        int size = 0;
+        for (byte[] packet : packets) {
+            if (packet.length > 0xFFFF) {
+                throw new IllegalArgumentException("packet too large for batch");
+            }
+            size += 2 + packet.length;
+        }
+        if (size > MAX_BATCH_PAYLOAD) {
+            throw new IllegalArgumentException("batch payload too large");
+        }
+        byte[] batch = new byte[size];
+        int p = 0;
+        for (byte[] packet : packets) {
+            p = putShort(batch, p, packet.length);
+            System.arraycopy(packet, 0, batch, p, packet.length);
+            p += packet.length;
+        }
+        return batch;
+    }
+
+    /** Decodes a payload marked with {@link #FLAG_BATCH}. */
+    public static List<byte[]> decodeBatch(byte[] payload) {
+        if (payload.length > MAX_BATCH_PAYLOAD) {
+            throw new IllegalArgumentException("batch payload too large");
+        }
+        List<byte[]> packets = new ArrayList<>();
+        int p = 0;
+        while (p < payload.length) {
+            if (payload.length - p < 2 || packets.size() == MAX_BATCH_PACKETS) {
+                throw new IllegalArgumentException("invalid batch framing");
+            }
+            int len = getShort(payload, p);
+            p += 2;
+            if (len == 0 || payload.length - p < len) {
+                throw new IllegalArgumentException("invalid batch packet length");
+            }
+            byte[] packet = new byte[len];
+            System.arraycopy(payload, p, packet, 0, len);
+            packets.add(packet);
+            p += len;
+        }
+        if (packets.isEmpty()) {
+            throw new IllegalArgumentException("empty batch");
+        }
+        return packets;
     }
 
     public static Data decodeData(byte[] b) {
@@ -91,6 +149,9 @@ public final class Wire {
     }
 
     public static Ack decodeAck(byte[] b) {
+        if (!isValidAck(b)) {
+            throw new IllegalArgumentException("invalid ACK frame");
+        }
         int p = 1;
         int ack = getInt(b, p); p += 4;
         int rwnd = getInt(b, p); p += 4;
@@ -103,6 +164,11 @@ public final class Wire {
             e[i] = getInt(b, p); p += 4;
         }
         return new Ack(ack, rwnd, echoTs, s, e);
+    }
+
+    public static boolean isValidAck(byte[] b) {
+        return b != null && b.length >= 18 && b[0] == T_ACK
+                && b.length == 18 + (b[17] & 0xFF) * 8;
     }
 
     // ---- Utilidades big-endian ------------------------------------------

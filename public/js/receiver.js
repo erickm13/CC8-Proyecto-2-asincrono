@@ -1,13 +1,14 @@
 // Receptor confiable (espejo de ReliableReceiver.java): ACK acumulativo + SACK,
 // entrega fuera de orden y deduplicación. El navegador hace el framing WebSocket.
 
-import { parseData, encodeAck } from './wire.js';
+import { parseData, parseDataPackets, encodeAck, parseImagePacket } from './wire.js';
 
 export class Receiver {
-    constructor(send, onDeliver, rwnd) {
+    constructor(send, onDeliver, rwnd, validatePacket = parseImagePacket) {
         this.send = send;            // (ArrayBuffer) => void
         this.onDeliver = onDeliver;  // (payload Uint8Array) => void
         this.rwnd = rwnd;
+        this.validatePacket = validatePacket;
         this.rcvNxt = 0;
         this.ooo = new Set();
         this.delivered = 0;
@@ -16,13 +17,14 @@ export class Receiver {
 
     onData(buf) {
         const d = parseData(buf);
+        const packets = parseDataPackets(d.payload, d.flags, this.validatePacket);
         const seq = d.seq;
         if (seq === this.rcvNxt) {
-            this.deliver(d.payload);
+            for (const packet of packets) this.deliver(packet);
             this.rcvNxt++;
             while (this.ooo.has(this.rcvNxt)) { this.ooo.delete(this.rcvNxt); this.rcvNxt++; }
         } else if (seq > this.rcvNxt) {
-            if (!this.ooo.has(seq)) { this.ooo.add(seq); this.deliver(d.payload); }
+            if (!this.ooo.has(seq)) { this.ooo.add(seq); for (const packet of packets) this.deliver(packet); }
             else this.duplicates++;
         } else {
             this.duplicates++;

@@ -11,9 +11,14 @@ import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Preprocesa una imagen a formato .h2k procesando por FRANJAS (strips) de
@@ -24,29 +29,77 @@ import java.util.Map;
  */
 public final class H2kWriter {
 
+    public static final int DEFAULT_THREADS = Math.max(1,
+            Math.min(4, Runtime.getRuntime().availableProcessors()));
+
     private final int tileSize;
     private final int levels;
     private final int precinct;
+    private final int compressionLevel;
+    private final int threads;
+
+    /**
+     * Duraciones en nanosegundos. readNanos mide RowSource.readStrip;
+     * outputWriteNanos mide las escrituras, índices, flush y parche del header.
+     * transformEncodeNanos suma tiempos de workers (puede superar elapsedNanos)
+     * e incluye la codificación del PNG de overview.
+     */
+    public record Metrics(long readNanos, long transformEncodeNanos,
+                          long outputWriteNanos, long elapsedNanos) { }
 
     public H2kWriter(int tileSize, int levels, int precinct) {
+        this(tileSize, levels, precinct, 6, DEFAULT_THREADS);
+    }
+
+    public H2kWriter(int tileSize, int levels, int precinct, int compressionLevel) {
+        this(tileSize, levels, precinct, compressionLevel, DEFAULT_THREADS);
+    }
+
+    public H2kWriter(int tileSize, int levels, int precinct, int compressionLevel, int threads) {
+        Zlib.checkLevel(compressionLevel);
+        if (threads < 1) throw new IllegalArgumentException("threads debe ser >= 1");
         this.tileSize = tileSize;
         this.levels = levels;
         this.precinct = precinct;
+        this.compressionLevel = compressionLevel;
+        this.threads = threads;
     }
+
+    private record TileResult(byte[] payload, List<List<H2kFormat.PacketIndex>> indices,
+                              long encodeNanos) { }
 
     /** Cuenta bytes escritos para conocer offsets absolutos. */
     private static final class Counting extends FilterOutputStream {
         long count = 0;
+        long writeNanos = 0;
         Counting(OutputStream out) {
             super(out);
         }
         @Override public void write(int b) throws IOException {
-            out.write(b);
-            count++;
+            long started = System.nanoTime();
+            try {
+                out.write(b);
+                count++;
+            } finally {
+                writeNanos += System.nanoTime() - started;
+            }
         }
         @Override public void write(byte[] b, int off, int len) throws IOException {
-            out.write(b, off, len);
-            count += len;
+            long started = System.nanoTime();
+            try {
+                out.write(b, off, len);
+                count += len;
+            } finally {
+                writeNanos += System.nanoTime() - started;
+            }
+        }
+        @Override public void flush() throws IOException {
+            long started = System.nanoTime();
+            try {
+                out.flush();
+            } finally {
+                writeNanos += System.nanoTime() - started;
+            }
         }
     }
 
@@ -57,6 +110,17 @@ public final class H2kWriter {
 
     /** Camino por streaming: procesa la imagen franja por franja. */
     public void write(RowSource src, Path outputPath) throws IOException {
+        writeWithMetrics(src, outputPath);
+    }
+
+    /**
+     * Camino por streaming que devuelve los tiempos acumulados de cada fase.
+     */
+    public Metrics writeWithMetrics(RowSource src, Path outputPath) throws IOException {
+        long elapsedStarted = System.nanoTime();
+        long readNanos = 0;
+        long transformEncodeNanos = 0;
+        long outputWriteNanos = 0;
         int width = src.width();
         int height = src.height();
         int components = src.components();
@@ -78,36 +142,58 @@ public final class H2kWriter {
         int ovH = tilesY * s0;
         byte[] overview = new byte[ovW * ovH * components];
 
+        ExecutorService workers = threads == 1 ? null : Executors.newFixedThreadPool(threads);
         try (Counting counting = new Counting(
-                new BufferedOutputStream(Files.newOutputStream(outputPath), 1 << 20));
+                     new BufferedOutputStream(Files.newOutputStream(outputPath), 1 << 20));
              DataOutputStream out = new DataOutputStream(counting)) {
 
             writeHeaderPlaceholder(out, components, width, height, tilesX, tilesY);
 
             for (int ty = 0; ty < tilesY; ty++) {
+                final int tileY = ty;
                 int y0 = ty * tileSize;
                 int validH = Math.min(tileSize, height - y0);
+                long readStarted = System.nanoTime();
                 int got = src.readStrip(strip, validH);
+                readNanos += System.nanoTime() - readStarted;
                 if (got < validH) {
                     throw new IOException("Fuente truncada: faltan filas en la franja " + ty);
                 }
 
+                ArrayDeque<Future<TileResult>> pending = new ArrayDeque<>();
                 for (int tx = 0; tx < tilesX; tx++) {
-                    int t = ty * tilesX + tx;
-                    int x0 = tx * tileSize;
-                    int validW = Math.min(tileSize, width - x0);
-
-                    List<List<H2kFormat.PacketIndex>> compIndices = new ArrayList<>();
-                    for (int c = 0; c < components; c++) {
-                        int[] coeff = extractFromStrip(strip, width, components,
-                                x0, validW, validH, c);
-                        HaarWavelet.forward2D(coeff, tileSize, levels);
-                        extractOverview(coeff, overview, ovW, components, s0, tx, ty, c);
-                        compIndices.add(encodeComponent(coeff, out, counting));
+                    final int tileX = tx;
+                    if (workers != null) {
+                        pending.addLast(workers.submit(() -> encodeTile(strip, width, components,
+                                validH, tileX, tileY, overview, ovW, s0)));
                     }
-
+                    if (workers != null && pending.size() < threads) continue;
+                    int outputTx = workers == null ? tx : tx - pending.size() + 1;
+                    TileResult tile = workers == null
+                            ? encodeTile(strip, width, components, validH, tx, ty, overview, ovW, s0)
+                            : awaitTile(pending.removeFirst());
+                    transformEncodeNanos += tile.encodeNanos();
+                    long payloadOffset = counting.count;
+                    out.write(tile.payload());
+                    int t = ty * tilesX + outputTx;
+                    int x0 = outputTx * tileSize;
+                    int validW = Math.min(tileSize, width - x0);
                     long idxOffset = counting.count;
-                    writeTileIndex(out, validW, validH, compIndices);
+                    writeTileIndex(out, validW, validH, tile.indices(), payloadOffset);
+                    tileIdxOffset[t] = idxOffset;
+                    tileIdxLen[t] = (int) (counting.count - idxOffset);
+                }
+                while (!pending.isEmpty()) {
+                    int outputTx = tilesX - pending.size();
+                    TileResult tile = awaitTile(pending.removeFirst());
+                    transformEncodeNanos += tile.encodeNanos();
+                    long payloadOffset = counting.count;
+                    out.write(tile.payload());
+                    int t = ty * tilesX + outputTx;
+                    int x0 = outputTx * tileSize;
+                    int validW = Math.min(tileSize, width - x0);
+                    long idxOffset = counting.count;
+                    writeTileIndex(out, validW, validH, tile.indices(), payloadOffset);
                     tileIdxOffset[t] = idxOffset;
                     tileIdxLen[t] = (int) (counting.count - idxOffset);
                 }
@@ -121,14 +207,53 @@ public final class H2kWriter {
 
             // Overview al final del archivo, como PNG.
             long ovOffset = counting.count;
+            long overviewEncodeStarted = System.nanoTime();
             byte[] png = encodeOverviewPng(overview, ovW, ovH, components);
+            transformEncodeNanos += System.nanoTime() - overviewEncodeStarted;
             out.write(png);
             out.flush();
 
+            long patchStarted = System.nanoTime();
             patchHeader(outputPath, dirOffset, ovOffset, png.length, ovW, ovH);
+            counting.writeNanos += System.nanoTime() - patchStarted;
+            outputWriteNanos = counting.writeNanos;
         } finally {
+            if (workers != null) workers.shutdownNow();
             src.close();
         }
+        return new Metrics(readNanos, transformEncodeNanos, outputWriteNanos,
+                System.nanoTime() - elapsedStarted);
+    }
+
+    private static TileResult awaitTile(Future<TileResult> future) throws IOException {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrumpido al codificar tile", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) throw io;
+            throw new IOException("Error al codificar tile", cause);
+        }
+    }
+
+    private TileResult encodeTile(byte[] strip, int width, int components, int validH,
+                                  int tx, int ty, byte[] overview, int ovW, int s0) throws IOException {
+        long started = System.nanoTime();
+        int x0 = tx * tileSize;
+        int validW = Math.min(tileSize, width - x0);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        Counting local = new Counting(bytes);
+        DataOutputStream out = new DataOutputStream(local);
+        List<List<H2kFormat.PacketIndex>> indices = new ArrayList<>();
+        for (int c = 0; c < components; c++) {
+            int[] coeff = extractFromStrip(strip, width, components, x0, validW, validH, c);
+            HaarWavelet.forward2D(coeff, tileSize, levels);
+            extractOverview(coeff, overview, ovW, components, s0, tx, ty, c);
+            indices.add(encodeComponent(coeff, out, local));
+        }
+        return new TileResult(bytes.toByteArray(), indices, System.nanoTime() - started);
     }
 
     /** Copia el bloque LL (s0 x s0) del tile transformado al buffer de overview. */
@@ -184,7 +309,7 @@ public final class H2kWriter {
             long[] offsets = new long[numPlanes];
             int[] lens = new int[numPlanes];
             if (numPlanes > 0) {
-                byte[][] layers = BitPlaneCoder.encode(values, numPlanes);
+                byte[][] layers = BitPlaneCoder.encode(values, numPlanes, compressionLevel);
                 for (int l = 0; l < numPlanes; l++) {
                     offsets[l] = counting.count;
                     out.write(layers[l]);
@@ -238,7 +363,7 @@ public final class H2kWriter {
     }
 
     private void writeTileIndex(DataOutputStream out, int validW, int validH,
-                                List<List<H2kFormat.PacketIndex>> comps) throws IOException {
+                                List<List<H2kFormat.PacketIndex>> comps, long payloadOffset) throws IOException {
         out.writeInt(validW);
         out.writeInt(validH);
         for (List<H2kFormat.PacketIndex> precincts : comps) {
@@ -250,7 +375,7 @@ public final class H2kWriter {
                 out.writeInt(p.numCoeffs());
                 out.writeByte(p.numPlanes());
                 for (int l = 0; l < p.numPlanes(); l++) {
-                    out.writeLong(p.layerOffset()[l]);
+                    out.writeLong(payloadOffset + p.layerOffset()[l]);
                     out.writeInt(p.layerLen()[l]);
                 }
             }
